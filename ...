@@ -1,0 +1,694 @@
+==> functions/index.js <==
+// functions/index.js
+const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { defineSecret } = require("firebase-functions/params");
+const admin = require("firebase-admin");
+const { sendWhatsAppText } = require("./whatsapp");
+
+admin.initializeApp();
+const db = admin.firestore();
+const FieldValue = admin.firestore.FieldValue;
+const Timestamp = admin.firestore.Timestamp;
+
+const WHATSAPP_TOKEN = defineSecret("WHATSAPP_TOKEN");
+const ORG_DOMAIN = "breakapp.internal";
+
+const DEFAULT_SETTINGS = {
+  shiftDurationHours: 9, 
+  mealBreakMin: 40, 
+  shortBreakMin: 20,
+  lockoutStartMin: 60, 
+  lockoutEndMin: 60, 
+  maxConcurrentBreaks: 2,
+  alertMode: "INDIVIDUAL", 
+  supervisorBroadcastNumbers: [],
+};
+
+// ============================================================================
+// INTERNAL ENGINE HELPERS
+// ============================================================================
+
+function assertAuth(request) {
+  if (!request.auth) throw new HttpsError("unauthenticated", "Strictly unauthenticated call.");
+  return request.auth.uid;
+}
+
+async function getSettings() {
+  const snap = await db.doc("break_settings/config").get();
+  return { ...DEFAULT_SETTINGS, ...(snap.exists ? snap.data() : {}) };
+}
+
+async function getUserDoc(uid) {
+  const snap = await db.doc(`users/${uid}`).get();
+  if (!snap.exists) throw new HttpsError("not-found", "Target user profile missing in DB.");
+  return { id: snap.id, ...snap.data() };
+}
+
+function requireRole(user, roles) {
+  if (!roles.includes(user.role)) {
+    throw new HttpsError("permission-denied", `Operation restricted to roles: ${roles.join(", ")}`);
+  }
+}
+
+async function nextSeq(counterPath, field = "value") {
+  const ref = db.doc(counterPath);
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const current = snap.exists ? (snap.data()[field] || 0) : 0;
+    const next = current + 1;
+    tx.set(ref, { [field]: next }, { merge: true });
+    return next;
+  });
+}
+
+function genPassword(length = 10) {
+  const charset = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+  let out = ""; 
+  for (let i = 0; i < length; i++) out += charset[Math.floor(Math.random() * charset.length)];
+  return out;
+}
+
+function bumpBudget(budget, category, minutes) {
+  if (category === "MEAL") return { ...budget, mealUsedMin: budget.mealUsedMin + minutes };
+  return { ...budget, shortUsedMin: budget.shortUsedMin + minutes };
+}
+
+function windowCheck(shift, settings, atMillis) {
+  const opensAt = shift.shiftStart.toMillis() + (settings.lockoutStartMin * 60000);
+  const closesAt = shift.shiftEnd.toMillis() - (settings.lockoutEndMin * 60000);
+  if (atMillis < opensAt) return { ok: false, reason: "TOO_EARLY", unlocksAtMillis: opensAt };
+  if (atMillis > closesAt) return { ok: false, reason: "TOO_LATE" };
+  return { ok: true, closesAtMillis: closesAt };
+}
+
+async function loadAgentShiftContext(uid) {
+  const user = await getUserDoc(uid);
+  if (user.role !== "AGENT") throw new HttpsError("permission-denied", "Only AGENT role can request breaks.");
+  if (!user.activeShiftId) throw new HttpsError("failed-precondition", "No active shift detected. Log in again.");
+  const shiftSnap = await db.doc(`shift_sessions/${user.activeShiftId}`).get();
+  if (!shiftSnap.exists || shiftSnap.data().status !== "ON_SHIFT") {
+    throw new HttpsError("failed-precondition", "Shift session is inactive or terminated.");
+  }
+  return { user, shift: { id: shiftSnap.id, ...shiftSnap.data() } };
+}
+
+// ============================================================================
+// ONBOARDING & USER MANAGEMENT
+// ============================================================================
+
+exports.createUserAccount = onCall(async (request) => {
+  const callerUid = assertAuth(request);
+  const caller = await getUserDoc(callerUid);
+  const { name, role, phone } = request.data || {};
+
+  if (!name || !phone || !["AGENT", "SUPERVISOR", "ADMIN"].includes(role)) {
+    throw new HttpsError("invalid-argument", "Malformed payload: name, role, phone required.");
+  }
+
+  if (role === "ADMIN") requireRole(caller, ["ADMIN"]);
+  else requireRole(caller, ["ADMIN", "SUPERVISOR"]);
+
+  if (role === "SUPERVISOR" && caller.role === "SUPERVISOR") {
+    throw new HttpsError("permission-denied", "Supervisors cannot spawn other Supervisors.");
+  }
+
+  const prefix = role === "AGENT" ? "AGT" : role === "SUPERVISOR" ? "SUP" : "ADM";
+  const seq = await nextSeq("counters/employeeId", prefix);
+  const employeeId = `${prefix}-${String(seq).padStart(4, "0")}`;
+  const password = genPassword();
+  const email = `${employeeId.toLowerCase()}@${ORG_DOMAIN}`;
+
+  const authUser = await admin.auth().createUser({ email, password, displayName: name });
+  await admin.auth().setCustomUserClaims(authUser.uid, { role });
+
+  await db.doc(`users/${authUser.uid}`).set({
+    uid: authUser.uid, 
+    employeeId, 
+    name, 
+    role, 
+    phone, 
+    active: true,
+    status: "OFFLINE", 
+    activeShiftId: null, 
+    activeBreakId: null,
+    createdAt: FieldValue.serverTimestamp(), 
+    createdBy: callerUid,
+  });
+
+  return { uid: authUser.uid, employeeId, password };
+});
+
+exports.resetPassword = onCall(async (request) => {
+  const callerUid = assertAuth(request);
+  const caller = await getUserDoc(callerUid);
+  requireRole(caller, ["ADMIN", "SUPERVISOR"]);
+
+  const { targetUid } = request.data || {};
+  if (!targetUid) throw new HttpsError("invalid-argument", "targetUid parameter required.");
+
+  const target = await getUserDoc(targetUid);
+  if (caller.role === "SUPERVISOR" && target.role !== "AGENT") {
+    throw new HttpsError("permission-denied", "Supervisors can only reset Agent passwords.");
+  }
+
+  const password = genPassword();
+  await admin.auth().updateUser(targetUid, { password });
+  return { password };
+});
+
+exports.setUserActive = onCall(async (request) => {
+  const callerUid = assertAuth(request);
+  const caller = await getUserDoc(callerUid);
+  requireRole(caller, ["ADMIN"]);
+
+  const { targetUid, active } = request.data || {};
+  await admin.auth().updateUser(targetUid, { disabled: !active });
+  await db.doc(`users/${targetUid}`).set({ active }, { merge: true });
+  return { ok: true };
+});
+
+// ============================================================================
+// SHIFT CLOCK MUTATIONS
+// ============================================================================
+
+exports.startShift = onCall(async (request) => {
+  const uid = assertAuth(request);
+  const user = await getUserDoc(uid);
+  if (user.role !== "AGENT") throw new HttpsError("failed-precondition", "Only Agents possess shift clocks.");
+  if (!user.active) throw new HttpsError("permission-denied", "User account is suspended.");
+
+  const settings = await getSettings();
+  const now = Timestamp.now();
+
+  if (user.activeShiftId) {
+    const existing = await db.doc(`shift_sessions/${user.activeShiftId}`).get();
+    if (existing.exists && existing.data().status === "ON_SHIFT" && existing.data().shiftEnd.toMillis() > now.toMillis()) {
+      await db.doc(`users/${uid}`).set({ status: "AVAILABLE" }, { merge: true });
+      return { shiftId: user.activeShiftId, resumed: true };
+    }
+  }
+
+  const shiftId = `${uid}_${now.toMillis()}`;
+  const shiftEnd = Timestamp.fromMillis(now.toMillis() + (settings.shiftDurationHours * 3600 * 1000));
+
+  await db.doc(`shift_sessions/${shiftId}`).set({
+    uid, 
+    employeeId: user.employeeId, 
+    name: user.name,
+    shiftStart: now, 
+    shiftEnd, 
+    loginAt: now, 
+    logoutAt: null, 
+    status: "ON_SHIFT",
+    breakBudget: { 
+      mealUsedMin: 0, 
+      shortUsedMin: 0, 
+      mealTotalMin: settings.mealBreakMin, 
+      shortTotalMin: settings.shortBreakMin 
+    },
+  });
+
+  await db.doc(`users/${uid}`).set({ activeShiftId: shiftId, status: "AVAILABLE" }, { merge: true });
+  return { shiftId, resumed: false };
+});
+
+exports.endShiftLogout = onCall(async (request) => {
+  const uid = assertAuth(request);
+  const user = await getUserDoc(uid);
+  if (user.activeShiftId) {
+    await db.doc(`shift_sessions/${user.activeShiftId}`).set({ 
+      status: "OFF_SHIFT", 
+      logoutAt: Timestamp.now() 
+    }, { merge: true });
+  }
+  await db.doc(`users/${uid}`).set({ status: "OFFLINE" }, { merge: true });
+  return { ok: true };
+});
+
+// ============================================================================
+// BREAK MANAGEMENT MUTATIONS (TRANSACTIONAL)
+// ============================================================================
+
+exports.requestBreakNow = onCall(async (request) => {
+  const uid = assertAuth(request);
+  const { category, minutesNow } = request.data || {};
+  if (!["MEAL", "SHORT"].includes(category)) throw new HttpsError("invalid-argument", "Category must be MEAL or SHORT.");
+
+  const settings = await getSettings();
+  const { user, shift } = await loadAgentShiftContext(uid);
+  if (user.activeBreakId) throw new HttpsError("already-exists", "Active break session already exists.");
+
+  const now = Timestamp.now();
+  const w = windowCheck(shift, settings, now.toMillis());
+  if (!w.ok) {
+    throw new HttpsError("failed-precondition", w.reason === "TOO_EARLY" 
+      ? "Breaks locked for the first hour of shift." 
+      : "Break window closed for the final hour of shift.");
+  }
+
+  const budget = shift.breakBudget;
+  let minutesToUse;
+
+  if (category === "MEAL") {
+    if (budget.mealUsedMin > 0) throw new HttpsError("already-exists", "Meal entitlement already consumed.");
+    minutesToUse = budget.mealTotalMin;
+  } else {
+    const shortRemaining = budget.shortTotalMin - budget.shortUsedMin;
+    if (shortRemaining <= 0) throw new HttpsError("failed-precondition", "Short break budget exhausted.");
+    minutesToUse = Math.min(Math.max(1, Math.round(minutesNow || shortRemaining)), shortRemaining);
+  }
+
+  let suggestedTimeMillis = null;
+  const activeSnap = await db.collection("break_sessions")
+    .where("status", "==", "ON_BREAK")
+    .orderBy("expectedEndAt", "asc")
+    .limit(1).get();
+  if (!activeSnap.empty) suggestedTimeMillis = activeSnap.docs[0].data().expectedEndAt.toMillis();
+
+  const breakRef = db.collection("break_sessions").doc();
+  const aggRef = db.doc("break_aggregates/live");
+  const shiftRef = db.doc(`shift_sessions/${shift.id}`);
+  const userRef = db.doc(`users/${uid}`);
+
+  const result = await db.runTransaction(async (tx) => {
+    const [aggSnap, shiftSnap2] = await Promise.all([tx.get(aggRef), tx.get(shiftRef)]);
+    const agg = aggSnap.exists ? aggSnap.data() : { activeCount: 0, queueLength: 0 };
+    const liveShift = shiftSnap2.data();
+
+    const base = {
+      uid, 
+      employeeId: user.employeeId, 
+      agentName: user.name, 
+      shiftId: shift.id,
+      breakCategory: category, 
+      requestedDurationMin: minutesToUse, 
+      mode: "NOW",
+      requestedAt: now, 
+      scheduledFor: null, 
+      notifiedReady: false, 
+      readyToStart: false,
+      breakEndedAt: null, 
+      actualMinutesUsed: null, 
+      exceeded: false, 
+      wasForceEnded: false, 
+      forceEndedBy: null,
+    };
+
+    if (agg.activeCount < settings.maxConcurrentBreaks) {
+      tx.set(breakRef, { 
+        ...base, 
+        status: "ON_BREAK", 
+        breakStartedAt: now,
+        expectedEndAt: Timestamp.fromMillis(now.toMillis() + (minutesToUse * 60000)), 
+        queueSeq: null, 
+        suggestedTime: null 
+      });
+      tx.set(aggRef, { activeCount: agg.activeCount + 1, queueLength: agg.queueLength }, { merge: true });
+      tx.set(shiftRef, { breakBudget: bumpBudget(liveShift.breakBudget, category, minutesToUse) }, { merge: true });
+      tx.set(userRef, { status: "ON_BREAK", activeBreakId: breakRef.id }, { merge: true });
+      return { status: "ON_BREAK" };
+    }
+    return { status: "QUEUE_PENDING" };
+  });
+
+  if (result.status === "ON_BREAK") return { status: "ON_BREAK", breakId: breakRef.id };
+
+  const seq = await nextSeq("counters/queueSeq", "value");
+  await db.runTransaction(async (tx) => {
+    const indexRef = db.doc("break_aggregates/queueIndex");
+    const [indexSnap, aggSnap2, shiftSnap3] = await Promise.all([tx.get(indexRef), tx.get(aggRef), tx.get(shiftRef)]);
+    
+    const order = indexSnap.exists ? (indexSnap.data().order || []) : [];
+    const agg2 = aggSnap2.exists ? aggSnap2.data() : { activeCount: 0, queueLength: 0 };
+
+    tx.set(breakRef, {
+      uid, employeeId: user.employeeId, agentName: user.name, shiftId: shift.id,
+      breakCategory: category, requestedDurationMin: minutesToUse, mode: "NOW",
+      status: "AWAITING_SLOT", requestedAt: now, scheduledFor: null,
+      notifiedReady: false, readyToStart: false, queueSeq: seq,
+      suggestedTime: suggestedTimeMillis ? Timestamp.fromMillis(suggestedTimeMillis) : null,
+      breakStartedAt: null, expectedEndAt: null, breakEndedAt: null,
+      actualMinutesUsed: null, exceeded: false, wasForceEnded: false, forceEndedBy: null,
+    });
+    tx.set(indexRef, { order: [...order, { uid, breakId: breakRef.id, queueSeq: seq }] }, { merge: true });
+    tx.set(aggRef, { activeCount: agg2.activeCount, queueLength: agg2.queueLength + 1 }, { merge: true });
+    tx.set(shiftRef, { breakBudget: bumpBudget(shiftSnap3.data().breakBudget, category, minutesToUse) }, { merge: true });
+    tx.set(userRef, { status: "IN_QUEUE", activeBreakId: breakRef.id }, { merge: true });
+  });
+
+  return { status: "AWAITING_SLOT", breakId: breakRef.id, suggestedTime: suggestedTimeMillis };
+});
+
+exports.requestBreakLater = onCall(async (request) => {
+  const uid = assertAuth(request);
+  const { category, minutesNow, scheduledFor } = request.data || {};
+  if (!["MEAL", "SHORT"].includes(category)) throw new HttpsError("invalid-argument", "Invalid category.");
+  if (!scheduledFor) throw new HttpsError("invalid-argument", "scheduledFor timestamp required.");
+
+  const settings = await getSettings();
+  const { user, shift } = await loadAgentShiftContext(uid);
+  if (user.activeBreakId) throw new HttpsError("already-exists", "Active request in progress.");
+
+  const schedMs = Number(scheduledFor);
+  const w = windowCheck(shift, settings, schedMs);
+  if (!w.ok) throw new HttpsError("invalid-argument", "Requested timestamp falls in shift lockout zone.");
+  if (schedMs <= Date.now()) throw new HttpsError("invalid-argument", "Scheduled time must be in future.");
+
+  const budget = shift.breakBudget;
+  let minutesToUse;
+
+  if (category === "MEAL") {
+    if (budget.mealUsedMin > 0) throw new HttpsError("already-exists", "Meal break already used.");
+    minutesToUse = budget.mealTotalMin;
+  } else {
+    const shortRemaining = budget.shortTotalMin - budget.shortUsedMin;
+    if (shortRemaining <= 0) throw new HttpsError("failed-precondition", "Short break budget exhausted.");
+    minutesToUse = Math.min(Math.max(1, Math.round(minutesNow || shortRemaining)), shortRemaining);
+  }
+
+  const intervalStart = schedMs;
+  const intervalEnd = schedMs + (minutesToUse * 60000);
+
+  const [scheduledSnap, activeSnap] = await Promise.all([
+    db.collection("break_sessions").where("status", "==", "APPROVED_SCHEDULED").get(),
+    db.collection("break_sessions").where("status", "==", "ON_BREAK").get(),
+  ]);
+
+  const blockers = [...scheduledSnap.docs, ...activeSnap.docs];
+  const overlapCount = blockers.filter((d) => {
+    const data = d.data();
+    const s = (data.scheduledFor || data.breakStartedAt).toMillis();
+    const e = data.expectedEndAt.toMillis();
+    return s < intervalEnd && e > intervalStart;
+  }).length;
+
+  if (overlapCount >= settings.maxConcurrentBreaks) {
+    const ends = blockers.map((d) => d.data().expectedEndAt.toMillis()).filter((t) => t > intervalStart).sort((a, b) => a - b);
+    return { ok: false, suggestedTime: ends[0] || (intervalStart + 900000) };
+  }
+
+  const breakRef = db.collection("break_sessions").doc();
+  await db.runTransaction(async (tx) => {
+    const shiftRef = db.doc(`shift_sessions/${shift.id}`);
+    const shiftSnap = await tx.get(shiftRef);
+    tx.set(breakRef, {
+      uid, employeeId: user.employeeId, agentName: user.name, shiftId: shift.id,
+      breakCategory: category, requestedDurationMin: minutesToUse, mode: "LATER",
+      status: "APPROVED_SCHEDULED", requestedAt: Timestamp.now(),
+      scheduledFor: Timestamp.fromMillis(intervalStart), notifiedReady: false, readyToStart: false,
+      queueSeq: null, suggestedTime: null, breakStartedAt: null,
+      expectedEndAt: Timestamp.fromMillis(intervalEnd), breakEndedAt: null,
+      actualMinutesUsed: null, exceeded: false, wasForceEnded: false, forceEndedBy: null,
+    });
+    tx.set(shiftRef, { breakBudget: bumpBudget(shiftSnap.data().breakBudget, category, minutesToUse) }, { merge: true });
+    tx.set(db.doc(`users/${uid}`), { status: "IN_QUEUE", activeBreakId: breakRef.id }, { merge: true });
+  });
+
+  return { ok: true, breakId: breakRef.id, scheduledFor: intervalStart };
+});
+
+exports.goingForBreak = onCall(async (request) => {
+  const uid = assertAuth(request);
+  const user = await getUserDoc(uid);
+  if (!user.activeBreakId) throw new HttpsError("failed-precondition", "No active break document linked.");
+  
+  const breakRef = db.doc(`break_sessions/${user.activeBreakId}`);
+  const settings = await getSettings();
+
+  return db.runTransaction(async (tx) => {
+    const [breakSnap, aggSnap] = await Promise.all([tx.get(breakRef), tx.get(db.doc("break_aggregates/live"))]);
+    if (!breakSnap.exists || breakSnap.data().status !== "APPROVED_SCHEDULED") {
+      throw new HttpsError("failed-precondition", "Break session is not in startable state.");
+    }
+    const b = breakSnap.data();
+    const now = Timestamp.now();
+    if (now.toMillis() < (b.scheduledFor.toMillis() - 30000)) throw new HttpsError("failed-precondition", "Premature start attempt.");
+    
+    const agg = aggSnap.exists ? aggSnap.data() : { activeCount: 0, queueLength: 0 };
+    if (agg.activeCount < settings.maxConcurrentBreaks) {
+      tx.set(breakRef, { 
+        status: "ON_BREAK", 
+        breakStartedAt: now,
+        expectedEndAt: Timestamp.fromMillis(now.toMillis() + (b.requestedDurationMin * 60000)) 
+      }, { merge: true });
+      tx.set(db.doc("break_aggregates/live"), { activeCount: agg.activeCount + 1, queueLength: agg.queueLength }, { merge: true });
+      tx.set(db.doc(`users/${uid}`), { status: "ON_BREAK" }, { merge: true });
+      return { status: "ON_BREAK" };
+    }
+    tx.set(breakRef, { status: "AWAITING_SLOT" }, { merge: true });
+    tx.set(db.doc(`users/${uid}`), { status: "IN_QUEUE" }, { merge: true });
+    return { status: "AWAITING_SLOT" };
+  });
+});
+
+async function endAndPromote(breakId, forcedBy) {
+  const breakRef = db.doc(`break_sessions/${breakId}`);
+  const aggRef = db.doc("break_aggregates/live");
+  const indexRef = db.doc("break_aggregates/queueIndex");
+
+  const summary = await db.runTransaction(async (tx) => {
+    const [breakSnap, aggSnap, indexSnap] = await Promise.all([tx.get(breakRef), tx.get(aggRef), tx.get(indexRef)]);
+    if (!breakSnap.exists || breakSnap.data().status !== "ON_BREAK") {
+      throw new HttpsError("failed-precondition", "Target session is not actively ON_BREAK.");
+    }
+    const b = breakSnap.data();
+    const now = Timestamp.now();
+    const elapsedMin = Math.round((now.toMillis() - b.breakStartedAt.toMillis()) / 60000);
+    const refundMin = Math.max(0, b.requestedDurationMin - elapsedMin);
+
+    const shiftRef = db.doc(`shift_sessions/${b.shiftId}`);
+    const shiftSnap = await tx.get(shiftRef);
+
+    tx.set(breakRef, { 
+      status: "COMPLETED", 
+      breakEndedAt: now, 
+      actualMinutesUsed: elapsedMin, 
+      forceEndedBy: forcedBy || null, 
+      wasForceEnded: !!forcedBy 
+    }, { merge: true });
+
+    if (refundMin > 0) {
+      tx.set(shiftRef, { breakBudget: bumpBudget(shiftSnap.data().breakBudget, b.breakCategory, -refundMin) }, { merge: true });
+    }
+    tx.set(db.doc(`users/${b.uid}`), { status: "AVAILABLE", activeBreakId: null }, { merge: true });
+
+    const agg = aggSnap.exists ? aggSnap.data() : { activeCount: 0, queueLength: 0 };
+    let newActive = Math.max(0, agg.activeCount - 1);
+    let newQueueLen = agg.queueLength;
+    const order = indexSnap.exists ? (indexSnap.data().order || []) : [];
+    let newOrder = order;
+    let promoted = null;
+
+    const head = order[0];
+    if (head) {
+      const promoteRef = db.doc(`break_sessions/${head.breakId}`);
+      const promoteSnap = await tx.get(promoteRef);
+      if (promoteSnap.exists) {
+        tx.set(promoteRef, { 
+          status: "ON_BREAK", 
+          breakStartedAt: now,
+          expectedEndAt: Timestamp.fromMillis(now.toMillis() + (promoteSnap.data().requestedDurationMin * 60000)) 
+        }, { merge: true });
+        tx.set(db.doc(`users/${head.uid}`), { status: "ON_BREAK" }, { merge: true });
+        newActive += 1; 
+        newQueueLen = Math.max(0, newQueueLen - 1); 
+        newOrder = order.slice(1);
+        promoted = { uid: head.uid, breakId: head.breakId };
+      }
+    }
+    tx.set(aggRef, { activeCount: newActive, queueLength: newQueueLen }, { merge: true });
+    tx.set(indexRef, { order: newOrder }, { merge: true });
+    return { endedAgentUid: b.uid, promoted };
+  });
+
+  if (summary.promoted) {
+    const promotedUser = await getUserDoc(summary.promoted.uid);
+    if (promotedUser.phone) {
+      await sendWhatsAppText({ 
+        token: WHATSAPP_TOKEN.value(), 
+        to: promotedUser.phone, 
+        body: `Hi ${promotedUser.name}, a break slot just opened up! You have been automatically promoted to ON_BREAK.` 
+      });
+    }
+  }
+  return summary;
+}
+
+exports.endBreak = onCall({ secrets: [WHATSAPP_TOKEN] }, async (request) => {
+  const uid = assertAuth(request);
+  const user = await getUserDoc(uid);
+  if (!user.activeBreakId) throw new HttpsError("failed-precondition", "No active break linked.");
+  return endAndPromote(user.activeBreakId, null);
+});
+
+exports.adminForceEndBreak = onCall({ secrets: [WHATSAPP_TOKEN] }, async (request) => {
+  const callerUid = assertAuth(request);
+  const caller = await getUserDoc(callerUid);
+  requireRole(caller, ["ADMIN", "SUPERVISOR"]);
+  const { targetUid } = request.data || {};
+  const target = await getUserDoc(targetUid);
+  if (!target.activeBreakId) throw new HttpsError("failed-precondition", "Agent is not on break.");
+  return endAndPromote(target.activeBreakId, callerUid);
+});
+
+exports.cancelScheduledBreak = onCall(async (request) => {
+  const uid = assertAuth(request);
+  const user = await getUserDoc(uid);
+  if (!user.activeBreakId) throw new HttpsError("failed-precondition", "No request found to cancel.");
+  const breakRef = db.doc(`break_sessions/${user.activeBreakId}`);
+
+  await db.runTransaction(async (tx) => {
+    const breakSnap = await tx.get(breakRef);
+    if (!breakSnap.exists) throw new HttpsError("not-found", "Break document missing.");
+    const b = breakSnap.data();
+    if (!["AWAITING_SLOT", "APPROVED_SCHEDULED"].includes(b.status)) {
+      throw new HttpsError("failed-precondition", "Cannot abort an active or completed break.");
+    }
+
+    const shiftRef = db.doc(`shift_sessions/${b.shiftId}`);
+    const shiftSnap = await tx.get(shiftRef);
+    tx.set(shiftRef, { breakBudget: bumpBudget(shiftSnap.data().breakBudget, b.breakCategory, -b.requestedDurationMin) }, { merge: true });
+    tx.set(breakRef, { status: "CANCELLED" }, { merge: true });
+    tx.set(db.doc(`users/${uid}`), { status: "AVAILABLE", activeBreakId: null }, { merge: true });
+
+    if (b.status === "AWAITING_SLOT") {
+      const indexRef = db.doc("break_aggregates/queueIndex");
+      const indexSnap = await tx.get(indexRef);
+      const order = indexSnap.exists ? (indexSnap.data().order || []) : [];
+      tx.set(indexRef, { order: order.filter((o) => o.breakId !== breakRef.id) }, { merge: true });
+      
+      const aggRef = db.doc("break_aggregates/live");
+      const aggSnap = await tx.get(aggRef);
+      const agg = aggSnap.exists ? aggSnap.data() : { activeCount: 0, queueLength: 0 };
+      tx.set(aggRef, { activeCount: agg.activeCount, queueLength: Math.max(0, agg.queueLength - 1) }, { merge: true });
+    }
+  });
+  return { ok: true };
+});
+
+// ============================================================================
+// BACKGROUND CRON MONITORS (EVERY 1 MINUTE)
+// ============================================================================
+
+exports.notifyApprovedScheduledBreaks = onSchedule({ schedule: "every 1 minutes", secrets: [WHATSAPP_TOKEN] }, async () => {
+  const now = Timestamp.now();
+  const snap = await db.collection("break_sessions")
+    .where("status", "==", "APPROVED_SCHEDULED")
+    .where("notifiedReady", "==", false)
+    .where("scheduledFor", "<=", now).get();
+
+  for (const docSnap of snap.docs) {
+    const b = docSnap.data();
+    await docSnap.ref.set({ notifiedReady: true, readyToStart: true }, { merge: true });
+    const user = await getUserDoc(b.uid).catch(() => null);
+    if (user?.phone) {
+      await sendWhatsAppText({ 
+        token: WHATSAPP_TOKEN.value(), 
+        to: user.phone, 
+        body: `Hi ${user.name}, your scheduled break time has arrived. Click 'Going for Break' on your console to begin.` 
+      });
+    }
+  }
+});
+
+exports.checkBreakOverruns = onSchedule({ schedule: "every 1 minutes", secrets: [WHATSAPP_TOKEN] }, async () => {
+  const now = Timestamp.now();
+  const settings = await getSettings();
+  const snap = await db.collection("break_sessions")
+    .where("status", "==", "ON_BREAK")
+    .where("exceeded", "==", false)
+    .where("expectedEndAt", "<=", now).get();
+  
+  if (snap.empty) return;
+
+  for (const docSnap of snap.docs) {
+    const b = docSnap.data();
+    await docSnap.ref.set({ exceeded: true }, { merge: true });
+    const user = await getUserDoc(b.uid).catch(() => null);
+    if (!user) continue;
+
+    await db.doc(`users/${b.uid}`).set({ status: "BREAK_EXCEEDED" }, { merge: true });
+    const overMin = Math.round((now.toMillis() - b.expectedEndAt.toMillis()) / 60000);
+
+    if (user.phone) {
+      await sendWhatsAppText({ 
+        token: WHATSAPP_TOKEN.value(), 
+        to: user.phone, 
+        body: `⚠️ CRITICAL: Your break has exceeded the allowed duration by ${overMin} mins. Return to your desk immediately.` 
+      });
+    }
+
+    const supMsg = `🚨 SLA BREACH: Agent ${user.name} (${user.employeeId}) has overrun their ${b.breakCategory} break by ${overMin} mins.`;
+    let recipients = settings.supervisorBroadcastNumbers || [];
+
+    if (settings.alertMode === "INDIVIDUAL" || recipients.length === 0) {
+      const presenceSnap = await db.collection("presence").where("role", "==", "SUPERVISOR").where("status", "==", "ONLINE").get();
+      const supDocs = await Promise.all(presenceSnap.docs.map((d) => getUserDoc(d.id).catch(() => null)));
+      recipients = supDocs.filter(Boolean).map((s) => s.phone).filter(Boolean);
+    }
+
+    for (const phone of recipients) {
+      await sendWhatsAppText({ token: WHATSAPP_TOKEN.value(), to: phone, body: supMsg });
+    }
+  }
+});
+    // ============================================================================
+// TEMPORARY GOD-MODE BACKDOOR (PULL THE TRIGGER THEN DELETE)
+// ============================================================================
+const { onRequest } = require("firebase-functions/v2/https");
+
+exports.spawnGenesisGod = onRequest(async (req, res) => {
+  try {
+    const name = "Harshit (Principal Architect)";
+    const phone = "+919999999999"; // Testing ke liye, aage badal lena
+    const employeeId = "ADM-0001";
+    const password = genPassword(12);
+    const email = `${employeeId.toLowerCase()}@${ORG_DOMAIN}`;
+
+    // 1. Check duplicate
+    const existing = await db.collection("users").where("employeeId", "==", employeeId).get();
+    if (!existing.empty) {
+      return res.status(200).send("⚠️ Genesis God 'ADM-0001' already exists in DB!");
+    }
+
+    // 2. Create in Auth
+    const authUser = await admin.auth().createUser({
+      email,
+      emailVerified: true,
+      password,
+      displayName: name,
+    });
+
+    // 3. Elevate to Admin Claim
+    await admin.auth().setCustomUserClaims(authUser.uid, { role: "ADMIN" });
+
+    // 4. Write to DB
+    await db.doc(`users/${authUser.uid}`).set({
+      uid: authUser.uid, employeeId, name, role: "ADMIN", phone,
+      active: true, status: "OFFLINE", activeShiftId: null, activeBreakId: null,
+      createdAt: FieldValue.serverTimestamp(), createdBy: "HTTP_TROJAN_HORSE",
+    });
+
+    // 5. Init counters & Base settings
+    await db.doc("counters/employeeId").set({ ADM: 1, SUP: 0, AGT: 0 }, { merge: true });
+    await db.doc("counters/queueSeq").set({ value: 0 }, { merge: true });
+    await db.doc("break_settings/config").set({
+      shiftDurationHours: 9, mealBreakMin: 40, shortBreakMin: 20,
+      lockoutStartMin: 60, lockoutEndMin: 60, maxConcurrentBreaks: 2,
+      alertMode: "INDIVIDUAL", supervisorBroadcastNumbers: [],
+    }, { merge: true });
+
+    res.status(200).send(`
+      <div style="font-family: monospace; padding: 30px; background: #0f172a; color: #38bdf8; border-radius: 10px;">
+        <h1 style="color: #4ade80;">[✔] SYSTEM OVERRIDE SUCCESSFUL</h1>
+        <p>Zero-Trust Admin Account has been forcefully seeded into production.</p>
+        <hr style="border-color: #334155;" />
+        <h2>Login ID : ${employeeId}</h2>
+        <h2>Password : <span style="background: #e11d48; color: white; padding: 2px 8px; border-radius: 4px;">${password}</span></h2>
+        <p style="color: #f43f5e; font-weight: bold;">CRITICAL: COPY THIS PASSWORD NOW. BURN THIS FUNCTION AFTER CLOSING.</p>
+      </div>
+    `);
+  } catch (err) {
+    res.status(500).send(`Backend Crash: ${err.message}`);
+  }
