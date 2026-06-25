@@ -4,11 +4,12 @@ import { httpsCallable } from "firebase/functions";
 import { db, functions } from "../firebase";
 import { useAuth } from "../context/AuthContext";
 import { useHeartbeat, useOnlineRoster } from "../hooks/usePresence";
-import { DEFAULT_SETTINGS } from "../utils/constants";
-import { 
-  UserPlus, LogOut, Copy, Loader2, Settings, Shield, Sliders, Database, CheckCircle2, 
-  Users, Search, Trash2, Edit, FolderPlus, Folder, X, Filter 
-} from "lucide-react";
+import { UserPlus, LogOut, Search, Edit, Trash2, X, Building2, FolderPlus, Folder, SlidersHorizontal, Lock } from "lucide-react";
+
+const DEFAULT_SETTINGS = { 
+  shiftDurationHours: 9, mealBreakMin: 40, shortBreakMin: 20, 
+  lockoutStartMin: 60, lockoutEndMin: 60, maxConcurrentBreaks: 2 
+};
 
 export default function AdminConsole() {
   const { profile, logout } = useAuth();
@@ -19,155 +20,298 @@ export default function AdminConsole() {
 
   const [users, setUsers] = useState([]);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
-  const [activePresences, setActivePresences] = useState(new Set());
-  
   const [projectsList, setProjectsList] = useState(["GENERAL", "BENTLEY", "FOOTLOCKER"]);
+  const [activePresences, setActivePresences] = useState(new Map());
+
+  // ⚡ THE BRAND NEW TAB STATE
+  const [activeTab, setActiveTab] = useState("DIRECTORY");
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [roleFilter, setRoleFilter] = useState("ALL");
+  const [projectFilter, setProjectFilter] = useState("ALL");
   const [editingUser, setEditingUser] = useState(null);
+  const [showProvision, setShowProvision] = useState(false);
 
-  useEffect(() => {
-    const unsub = onSnapshot(collection(db, "presence"), (snap) => {
-      const onlineSet = new Set();
-      snap.docs.forEach((d) => { if (d.data()?.status === "ONLINE") onlineSet.add(d.id); });
-      setActivePresences(onlineSet);
-    });
-    return () => unsub();
+  const myProject = (profile?.project || "GENERAL").trim().toUpperCase();
+  const isSuperAdmin = profile?.role === "SUPER_ADMIN" || (profile?.role === "ADMIN" && ["ROOT", "ALL", "GENERAL"].includes(myProject));
+
+  useEffect(() => { 
+    const unsub = onSnapshot(collection(db, "users"), snap => setUsers(snap.docs.map(d => ({ id: d.id, ...d.data() })))); 
+    return () => unsub(); 
+  }, []);
+  
+  useEffect(() => { 
+    const unsub = onSnapshot(collection(db, "projects"), snap => { 
+      const pArr = snap.docs.map(d => d.id); 
+      if (!pArr.includes("GENERAL")) pArr.unshift("GENERAL"); 
+      setProjectsList(pArr); 
+    }); 
+    return () => unsub(); 
+  }, []);
+  
+  useEffect(() => { 
+    const unsub = onSnapshot(doc(db, "break_settings", "config"), snap => { 
+      if (snap.exists()) setSettings(snap.data()); 
+    }); 
+    return () => unsub(); 
+  }, []);
+  
+  useEffect(() => { 
+    const unsub = onSnapshot(collection(db, "presence"), snap => { 
+      const pMap = new Map(); 
+      snap.docs.forEach(d => { if (d.data()?.status === "ONLINE") pMap.set(d.id, d.data()); }); 
+      setActivePresences(pMap); 
+    }); 
+    return () => unsub(); 
   }, []);
 
-  useEffect(() => {
-    const unsub = onSnapshot(collection(db, "users"), (snap) => setUsers(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
-    return () => unsub();
-  }, []);
+  const visibleUsers = useMemo(() => 
+    isSuperAdmin ? users : users.filter(u => (u.project || "GENERAL").toUpperCase() === myProject), 
+  [users, isSuperAdmin, myProject]);
 
-  useEffect(() => {
-    const unsub = onSnapshot(doc(db, "break_settings", "config"), (snap) => { if (snap.exists()) setSettings(snap.data()); });
-    return () => unsub();
-  }, []);
+  const processedUsers = useMemo(() => {
+    return visibleUsers
+      .filter(u => {
+        const m = u.name?.toLowerCase().includes(searchQuery.toLowerCase()) || u.employeeId?.toLowerCase().includes(searchQuery.toLowerCase());
+        if (!m) return false;
+        if (roleFilter !== "ALL" && u.role !== roleFilter) return false;
+        if (isSuperAdmin && projectFilter !== "ALL" && (u.project || "GENERAL").toUpperCase() !== projectFilter.toUpperCase()) return false;
+        return true;
+      })
+      .sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  }, [visibleUsers, searchQuery, roleFilter, projectFilter, isSuperAdmin]);
 
-  useEffect(() => {
-    const unsub = onSnapshot(collection(db, "projects"), (snap) => {
-      const pArr = snap.docs.map(d => d.id);
-      if (!pArr.includes("GENERAL")) pArr.unshift("GENERAL");
-      setProjectsList(pArr);
-    });
-    return () => unsub();
-  }, []);
+  const counts = useMemo(() => ({
+    total: visibleUsers.length, 
+    admins: visibleUsers.filter(u => u.role === "ADMIN" || u.role === "SUPER_ADMIN").length,
+    supervisors: visibleUsers.filter(u => u.role === "SUPERVISOR").length, 
+    agents: visibleUsers.filter(u => u.role === "AGENT").length,
+  }), [visibleUsers]);
 
   return (
-    <div className="min-h-screen bg-[#09090b] text-zinc-100 pb-24 font-sans selection:bg-indigo-500 selection:text-white relative">
-      
-      <header className="sticky top-0 z-40 border-b border-zinc-800 bg-[#09090b]/90 backdrop-blur-md px-6 py-4 transition-all font-sans">
+    <div className="relative min-h-screen text-slate-800 font-sans pb-24 selection:bg-indigo-500 selection:text-white">
+      <div className="mesh-bg" />
+
+      {/* TOP HEADER */}
+      <header className="glass-bar sticky top-0 z-40 px-6 py-4 font-sans">
         <div className="mx-auto flex max-w-7xl items-center justify-between">
-          <div className="flex items-center gap-3.5">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-zinc-900 border border-zinc-700 text-indigo-400 font-mono font-bold shadow-sm">
-              ADM
+          <div className="flex items-center gap-3">
+            <div className={`flex h-10 w-10 items-center justify-center rounded-xl text-white font-black text-sm shadow-md font-mono ${isSuperAdmin ? 'bg-gradient-to-br from-slate-900 to-indigo-950' : 'bg-gradient-to-br from-indigo-600 to-violet-600'}`}>
+              {isSuperAdmin ? 'SAD' : 'AD'}
             </div>
             <div>
-              <div className="flex items-center gap-2 font-mono">
-                <h1 className="text-base font-bold tracking-wide uppercase text-white font-sans">Admin Headquarters</h1>
-                <span className="rounded bg-indigo-500/10 px-2 py-0.5 text-[10px] font-bold text-indigo-400 border border-indigo-500/20 font-mono">
-                  GLOBAL CONTROL
+              <div className="flex items-center gap-2">
+                <h1 className="text-sm font-black uppercase text-slate-900">
+                  {isSuperAdmin ? "Global Headquarters" : "Project Admin Console"}
+                </h1>
+                <span className={`rounded-full border px-2.5 py-0.5 text-[10px] font-bold font-mono ${isSuperAdmin ? 'bg-rose-50/80 border-rose-200/80 text-rose-600' : 'bg-indigo-50/80 border-indigo-200 text-indigo-700'}`}>
+                  {isSuperAdmin ? "ROOT ACCESS" : `${myProject} TENANT`}
                 </span>
               </div>
-              <p className="text-xs text-zinc-400 mt-0.5 font-sans">
-                Administrator: <strong className="text-zinc-200">{profile?.name}</strong> ({profile?.employeeId})
-              </p>
+              <p className="text-xs text-slate-500 mt-0.5 font-sans">Operator: <strong className="text-slate-700">{profile?.name}</strong></p>
             </div>
           </div>
-
+          
           <div className="flex items-center gap-4 font-mono">
-            <div className="flex items-center gap-3 bg-zinc-950 px-3.5 py-2 rounded-xl border border-zinc-800 text-xs text-zinc-400 shadow-inner font-sans">
-              <span>{supervisorsOnline.length} Sup Online</span>
-              <span className="text-zinc-700">|</span>
-              <span>{agentsOnline.length} Agt Online</span>
-            </div>
-            <button onClick={logout} className="flex items-center gap-1.5 rounded-xl border border-zinc-800 bg-zinc-900 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-zinc-800 hover:text-white transition-all active:scale-95 cursor-pointer font-sans">
-              <LogOut size={13} /> Log Out
+            {isSuperAdmin && (
+              <div className="flex items-center gap-3 bg-slate-50 px-3.5 py-2 rounded-xl border border-slate-200 text-xs font-bold text-slate-600 shadow-inner font-sans">
+                <span className="text-indigo-600">{supervisorsOnline.length} Sup Online</span>
+                <span className="text-slate-300">|</span>
+                <span className="text-emerald-600">{agentsOnline.length} Agt Online</span>
+              </div>
+            )}
+            <button onClick={() => setShowProvision(true)} className="btn-glass flex items-center gap-2 rounded-xl px-4 py-2 text-xs font-black uppercase tracking-wider cursor-pointer font-sans">
+              <UserPlus size={14} /> <span>Provision User</span>
+            </button>
+            <button onClick={logout} className="btn-soft flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-bold text-rose-600 cursor-pointer font-sans">
+              <LogOut size={13} /> Logout
             </button>
           </div>
         </div>
       </header>
 
-      <div className="border-b border-zinc-800/60 bg-zinc-950/60 py-2.5 px-6 font-mono text-xs">
-        <div className="max-w-7xl mx-auto flex items-center justify-between text-zinc-400">
-          <span>Active Tenants: <strong className="text-amber-400">{projectsList.length} Fences</strong></span>
-          <span>Matrix Filter: <strong className="text-emerald-400 font-bold">2-WAY TENANT INTERSECT</strong></span>
+      {/* ⚡ THE BRAND NEW CLEAN TAB NAVIGATION BAR */}
+      <div className="glass-bar relative z-10 py-3 px-6 font-sans">
+        <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3 text-xs font-mono font-bold">
+          <div className="flex flex-wrap gap-2">
+            <button 
+              onClick={() => setActiveTab("DIRECTORY")} 
+              className={`px-4 py-2 rounded-xl cursor-pointer transition-all font-sans ${activeTab === "DIRECTORY" ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/25" : "btn-soft text-slate-500 hover:text-indigo-600"}`}
+            >
+              ⚡ Workforce Directory
+            </button>
+            
+            {isSuperAdmin && (
+              <button 
+                onClick={() => setActiveTab("TENANTS")} 
+                className={`px-4 py-2 rounded-xl cursor-pointer flex items-center gap-1.5 transition-all font-sans ${activeTab === "TENANTS" ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/25" : "btn-soft text-slate-500 hover:text-indigo-600"}`}
+              >
+                <FolderPlus size={14} /> Manage Tenants
+              </button>
+            )}
+
+            <button 
+              onClick={() => setActiveTab("SETTINGS")} 
+              className={`px-4 py-2 rounded-xl cursor-pointer flex items-center gap-1.5 transition-all font-sans ${activeTab === "SETTINGS" ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/25" : "btn-soft text-slate-500 hover:text-indigo-600"}`}
+            >
+              <SlidersHorizontal size={14} /> Floor Invariants
+            </button>
+          </div>
+          
+          <span className="text-slate-400 font-sans">
+            Scope Filter: <strong className="text-emerald-600 font-bold font-mono">{isSuperAdmin ? "GLOBAL (ALL DATA)" : `${myProject} STRICT`}</strong>
+          </span>
         </div>
       </div>
 
-      <main className="mx-auto max-w-7xl px-6 mt-8 font-sans">
-        <div className="grid grid-cols-1 gap-8 lg:grid-cols-12">
-          
-          <div className="space-y-8 lg:col-span-5 font-sans">
+      <main className="relative z-10 mx-auto max-w-7xl px-6 mt-8 font-sans">
+        
+        {/* TAB 1: WORKFORCE DIRECTORY (Full Screen Width!) */}
+        {activeTab === "DIRECTORY" && (
+          <div className="space-y-8 animate-in fade-in zoom-in-95 duration-300">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4 font-mono">
+              <div className="glass rounded-[28px] p-5">
+                <span className="text-[10px] text-slate-400 uppercase font-bold block mb-1 font-sans">{isSuperAdmin ? "Total Workforce" : "Project Workforce"}</span>
+                <div className="text-3xl font-black text-slate-900">{counts.total}</div>
+              </div>
+              <div className="glass rounded-[28px] p-5 text-rose-700">
+                <span className="text-[10px] text-slate-400 uppercase font-bold block mb-1 font-sans">Admins</span>
+                <div className="text-3xl font-black text-slate-900">{counts.admins}</div>
+              </div>
+              <div className="glass rounded-[28px] p-5 text-indigo-700">
+                <span className="text-[10px] text-slate-400 uppercase font-bold block mb-1 font-sans">Supervisors</span>
+                <div className="text-3xl font-black text-slate-900">{counts.supervisors}</div>
+              </div>
+              <div className="glass rounded-[28px] p-5 text-emerald-700">
+                <span className="text-[10px] text-slate-400 uppercase font-bold block mb-1 font-sans">Agents</span>
+                <div className="text-3xl font-black text-slate-900">{counts.agents}</div>
+              </div>
+            </div>
+
+            <div className="glass rounded-[32px] p-7 space-y-6 font-sans">
+              <div className="flex flex-wrap gap-3 justify-between items-center border-b border-slate-200/80 pb-5 font-mono">
+                <div className="relative w-80">
+                  <Search size={14} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                  <input type="text" value={searchQuery} onChange={e => setSearchQuery(e.target.value)} placeholder={`Search ${isSuperAdmin ? "global directory" : myProject + " directory"}...`} className="input-glass w-full rounded-xl py-2 pl-9 pr-4 text-xs font-bold text-slate-800 outline-none font-sans" />
+                </div>
+                
+                <div className="flex gap-2 font-mono">
+                  <select value={roleFilter} onChange={e => setRoleFilter(e.target.value)} className="input-glass rounded-xl px-3 py-2 text-xs font-bold text-slate-700 outline-none cursor-pointer">
+                    <option value="ALL">All Roles</option>
+                    <option value="ADMIN">Admin</option>
+                    <option value="SUPERVISOR">Supervisor</option>
+                    <option value="AGENT">Agent</option>
+                  </select>
+                  
+                  {isSuperAdmin ? (
+                    <select value={projectFilter} onChange={e => setProjectFilter(e.target.value)} className="input-glass rounded-xl px-3 py-2 text-xs font-bold text-indigo-600 outline-none cursor-pointer">
+                      <option value="ALL">All Tenants</option>
+                      {projectsList.map(p => <option key={p} value={p}>{p}</option>)}
+                    </select>
+                  ) : (
+                    <span className="input-glass rounded-xl px-4 py-2 text-xs font-bold text-indigo-700 bg-white shadow-sm flex items-center gap-1.5">
+                      <Lock size={12}/> {myProject} Tenant
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              <div className="overflow-x-auto rounded-2xl border border-slate-200/60 font-sans">
+                <table className="w-full text-left border-collapse">
+                  <thead className="bg-slate-50/50 font-mono text-[10px] font-bold uppercase text-slate-500">
+                    <tr>
+                      <th className="py-4 pl-5">User</th>
+                      <th className="py-4 px-3">Role</th>
+                      <th className="py-4 px-3">Tenant</th>
+                      <th className="py-4 px-3">Status</th>
+                      <th className="py-4 text-right pr-5">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 text-xs font-medium text-slate-700 font-sans">
+                    {processedUsers.map(u => (
+                      <AdminUserRow key={u.uid || u.id} user={u} livePresence={activePresences.get(u.uid || u.id)} onEdit={() => setEditingUser(u)} isSuperAdmin={isSuperAdmin} />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* TAB 2: MANAGE TENANTS (Centered & Clean) */}
+        {activeTab === "TENANTS" && isSuperAdmin && (
+          <div className="max-w-2xl mx-auto animate-in fade-in zoom-in-95 duration-300 mt-12">
             <ProjectTenantsManagerCard projectsList={projectsList} profile={profile} />
-            <OnboardSection projectsList={projectsList} />
-            <ConfigSection currentSettings={settings} />
           </div>
+        )}
 
-          <div className="lg:col-span-7 font-sans">
-            <RosterSection users={users} livePresences={activePresences} projectsList={projectsList} onEditEmployee={(u) => setEditingUser(u)} />
+        {/* TAB 3: FLOOR INVARIANTS (Centered & Clean) */}
+        {activeTab === "SETTINGS" && (
+          <div className="max-w-2xl mx-auto animate-in fade-in zoom-in-95 duration-300 mt-12">
+            <ConfigSettingsCard currentSettings={settings} isSuperAdmin={isSuperAdmin} myProject={myProject} />
           </div>
+        )}
 
-        </div>
       </main>
 
-      {editingUser && (
-        <EditEmployeeModal user={editingUser} projectsList={projectsList} onClose={() => setEditingUser(null)} />
-      )}
+      {editingUser && <EditEmployeeModal user={editingUser} projectsList={projectsList} onClose={() => setEditingUser(null)} isSuperAdmin={isSuperAdmin} myProject={myProject} />}
+      {showProvision && <AdminProvisionModal projectsList={projectsList} onClose={() => setShowProvision(false)} isSuperAdmin={isSuperAdmin} myProject={myProject} />}
 
+      <footer className="relative z-10 py-8 text-center font-sans">
+        <p className="text-xs font-bold text-slate-400 tracking-wide">
+          Made with <span className="text-rose-500 inline-block animate-bounce">❤️</span> by <strong className="text-slate-600 font-black">Harshit Sinha</strong>
+        </p>
+      </footer>
     </div>
   );
 }
 
-// ⚡ 1. HYBRID DIRECT-STAMP PROJECT MANAGER (Never fails!)
+// -------------------------------------------------------------
+// CHILD COMPONENTS
+// -------------------------------------------------------------
+
 function ProjectTenantsManagerCard({ projectsList, profile }) {
-  const [newProj, setNewProj] = useState(""); const [busy, setBusy] = useState(false);
-
-  const handleAddTenant = async (e) => {
+  const [newProj, setNewProj] = useState(""); 
+  const [busy, setBusy] = useState(false);
+  
+  const handleAddTenant = async (e) => { 
     e.preventDefault(); 
-    const code = newProj.trim().toUpperCase();
+    const code = newProj.trim().toUpperCase(); 
     if (!code) return; 
-    setBusy(true);
-
-    try {
-      // ⚡ HYBRID OVERRIDE: Directly stamp Firestore! Bypasses Cloud Run sleep timeouts.
+    setBusy(true); 
+    try { 
       await setDoc(doc(db, "projects", code), { 
-        id: code, name: code, 
-        createdAt: serverTimestamp(), createdBy: profile?.uid || "ADMIN" 
-      }, { merge: true });
-
-      setNewProj("");
-    } catch (err) { alert("Project stamp failed: " + err.message); } finally { setBusy(false); }
+        id: code, name: code, createdAt: serverTimestamp(), createdBy: profile?.uid || "ADMIN" 
+      }, { merge: true }); 
+      setNewProj(""); 
+    } catch(e) { alert(e.message); } finally { setBusy(false); } 
   };
 
-  const handleRemoveTenant = async (pName) => {
-    if (pName === "GENERAL") return alert("GENERAL tenant is system protected.");
-    if (!confirm(`Permanently purge Project Tenant '${pName}'?`)) return;
-    setBusy(true);
+  const handleRemoveTenant = async (pName) => { 
+    if (pName === "GENERAL") return alert("GENERAL is a protected global tenant."); 
+    if (!confirm(`Purge project tenant '${pName}' entirely?`)) return; 
+    setBusy(true); 
     try { await deleteDoc(doc(db, "projects", pName)); } 
-    catch (err) { alert("Delete failed: " + err.message); } finally { setBusy(false); }
+    catch(e) { alert(e.message); } finally { setBusy(false); } 
   };
 
   return (
-    <div className="rounded-3xl border border-zinc-800 bg-zinc-900/40 p-7 shadow-xl font-sans">
-      <div className="flex items-center justify-between border-b border-zinc-800 pb-4 mb-5 font-mono">
-        <div className="flex items-center gap-2"><FolderPlus size={16} className="text-cyan-400" /><h2 className="text-xs font-bold uppercase tracking-wider text-white">Manage Project Tenants</h2></div>
-        <span className="text-[10px] text-emerald-400 font-bold uppercase bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-500/30">Direct Stamp</span>
+    <div className="glass rounded-[32px] p-8 space-y-6 font-sans">
+      <div className="flex justify-between border-b border-slate-200/80 pb-4 font-mono font-bold text-xs text-indigo-600">
+        <span className="flex items-center gap-2"><FolderPlus size={16}/> Manage Project Tenants</span>
+        <span className="text-[10px] bg-emerald-50 text-emerald-700 border border-emerald-200 px-3 py-1 rounded-full font-mono font-bold shadow-sm">Global Stamp</span>
       </div>
-
-      <form onSubmit={handleAddTenant} className="flex gap-2 mb-4">
-        <input type="text" required value={newProj} onChange={e => setNewProj(e.target.value.toUpperCase())} placeholder="NEW_PROJECT_CODE..." className="flex-1 bg-zinc-950 border border-zinc-800 rounded-xl px-3.5 py-2.5 text-xs text-cyan-300 font-mono font-bold outline-none focus:border-indigo-500"/>
-        <button type="submit" disabled={busy} className="bg-cyan-500 hover:bg-cyan-400 text-black font-black px-4 py-2.5 rounded-xl text-xs uppercase cursor-pointer transition-all active:scale-95 disabled:opacity-50">
-          {busy ? "..." : "Add"}
-        </button>
+      
+      <form onSubmit={handleAddTenant} className="flex gap-3">
+        <input type="text" required value={newProj} onChange={e => setNewProj(e.target.value.toUpperCase())} placeholder="e.g., ADIDAS_UK..." className="input-glass flex-1 rounded-2xl px-5 py-4 text-sm font-mono font-bold text-slate-900 outline-none focus:border-indigo-600"/>
+        <button type="submit" disabled={busy} className="btn-glass font-bold px-6 py-4 rounded-2xl text-xs uppercase tracking-widest cursor-pointer shadow-md active:scale-95 font-sans">Add Tenant</button>
       </form>
-
-      <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto pr-1">
+      
+      <div className="flex flex-wrap gap-2 pt-2 max-h-48 overflow-y-auto pr-1">
         {projectsList.map(p => (
-          <span key={p} className="inline-flex items-center gap-1 bg-zinc-950 pl-2.5 pr-2 py-1 rounded-lg border border-zinc-800 text-xs font-bold text-zinc-300 font-mono">
-            <Folder size={11} className="text-indigo-400" /> <span>{p}</span>
-            {p !== "GENERAL" && (
-              <button type="button" onClick={() => handleRemoveTenant(p)} className="text-zinc-500 hover:text-rose-400 ml-1 cursor-pointer"><X size={12} /></button>
-            )}
+          <span key={p} className="inline-flex items-center gap-1.5 bg-white/80 px-4 py-2 rounded-xl border border-slate-200/80 text-xs font-bold text-slate-700 font-mono transition-all hover:bg-white hover:shadow-md hover:-translate-y-0.5">
+            <Folder size={12} className="text-indigo-600"/> <span>{p}</span>
+            {p !== "GENERAL" && <button type="button" onClick={() => handleRemoveTenant(p)} className="text-slate-400 hover:text-rose-600 ml-1.5 cursor-pointer"><X size={14}/></button>}
           </span>
         ))}
       </div>
@@ -175,168 +319,290 @@ function ProjectTenantsManagerCard({ projectsList, profile }) {
   );
 }
 
-function OnboardSection({ projectsList }) {
-  const [name, setName] = useState(""); const [role, setRole] = useState("AGENT"); 
-  const [phone, setPhone] = useState(""); const [project, setProject] = useState("GENERAL");
-  const [busy, setBusy] = useState(false); const [spawned, setSpawned] = useState(null); const [err, setErr] = useState(null);
-
-  const handleOnboard = async (e) => {
-    e.preventDefault(); if (!name || !phone) return; setBusy(true); setErr(null); setSpawned(null);
-    try {
-      const res = await httpsCallable(functions, "createUserAccount")({ name: name.trim(), role, phone: phone.trim(), project });
-      setSpawned(res.data); setName(""); setPhone("");
-    } catch (error) { setErr(error.message || "Failed to create user."); } finally { setBusy(false); }
+function ConfigSettingsCard({ currentSettings, isSuperAdmin, myProject }) {
+  const [form, setForm] = useState(currentSettings); 
+  const [busy, setBusy] = useState(false); 
+  const [saved, setSaved] = useState(false);
+  
+  useEffect(() => { setForm(currentSettings); }, [currentSettings]);
+  
+  const handleSaveConfig = async (e) => { 
+    e.preventDefault(); setBusy(true); 
+    try { 
+      await setDoc(doc(db, "break_settings", "config"), { ...form, updatedAt: serverTimestamp() }, { merge: true }); 
+      setSaved(true); setTimeout(() => setSaved(false), 2500); 
+    } catch (err) { alert(err.message); } finally { setBusy(false); } 
   };
 
   return (
-    <div className="rounded-3xl border border-zinc-800 bg-zinc-900/40 p-7 shadow-xl">
-      <div className="flex items-center justify-between border-b border-zinc-800 pb-4 mb-6 font-mono"><div className="flex items-center gap-2"><UserPlus size={15} className="text-indigo-400" /><h2 className="text-xs font-bold uppercase tracking-wider text-white">Add Personnel</h2></div><span className="text-[10px] text-zinc-500 uppercase font-medium">Tenant Spawner</span></div>
-
-      <form onSubmit={handleOnboard} className="space-y-4 font-mono">
-        <div><label className="block text-[11px] text-zinc-400 mb-1 font-sans">Full Display Name</label><input type="text" required value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Tanvi Sharma" className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-4 py-2.5 text-xs text-white focus:outline-none focus:border-indigo-500 font-sans" /></div>
-        <div className="grid grid-cols-2 gap-3.5 font-sans">
-          <div><label className="block text-[11px] text-zinc-400 mb-1 font-sans">Clearance Role</label><select value={role} onChange={(e) => setRole(e.target.value)} className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2.5 text-xs font-bold text-indigo-300 focus:outline-none focus:border-indigo-500 cursor-pointer font-sans"><option value="AGENT">Shift Agent</option><option value="SUPERVISOR">Supervisor</option><option value="ADMIN" className="text-rose-400 font-bold">Administrator</option></select></div>
-          <div><label className="block text-[11px] text-zinc-400 mb-1 font-sans">Assign Project</label><select value={project} onChange={(e) => setProject(e.target.value)} className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2.5 text-xs font-mono font-bold text-amber-400 focus:outline-none focus:border-indigo-500 cursor-pointer font-sans">{projectsList.map(p => <option key={p} value={p}>{p}</option>)}</select></div>
+    <div className="glass rounded-[32px] p-8 space-y-6 font-sans">
+      <div className="flex justify-between items-center border-b border-slate-200/80 pb-4 font-mono font-bold text-xs text-indigo-600">
+        <span className="flex items-center gap-2"><SlidersHorizontal size={16} /> {isSuperAdmin ? "Global" : myProject} WFM Timings & Lockouts</span>
+        {saved ? <span className="text-emerald-700 font-black bg-emerald-50 px-3 py-1 rounded-full border border-emerald-200 shadow-sm">✓ LEDGER SAVED</span> : <span className="text-[10px] text-slate-400 uppercase tracking-widest bg-slate-50 px-3 py-1 rounded-full border border-slate-200">Invariants</span>}
+      </div>
+      
+      <form onSubmit={handleSaveConfig} className="space-y-5 text-xs">
+        <div className="grid grid-cols-2 gap-4">
+          <div className="bg-white/60 p-4 rounded-2xl border border-slate-200/60 shadow-sm">
+            <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest font-mono mb-2">Meal Break Limit</label>
+            <div className="flex items-center gap-2"><input type="number" min={1} required value={form?.mealBreakMin ?? 40} onChange={e => setForm({...form, mealBreakMin: Number(e.target.value)})} className="w-full bg-transparent font-black text-slate-900 font-mono text-lg outline-none" /><span className="text-slate-400 font-mono font-bold">Mins</span></div>
+          </div>
+          <div className="bg-white/60 p-4 rounded-2xl border border-slate-200/60 shadow-sm">
+            <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest font-mono mb-2">Short Break Limit</label>
+            <div className="flex items-center gap-2"><input type="number" min={1} required value={form?.shortBreakMin ?? 20} onChange={e => setForm({...form, shortBreakMin: Number(e.target.value)})} className="w-full bg-transparent font-black text-slate-900 font-mono text-lg outline-none" /><span className="text-slate-400 font-mono font-bold">Mins</span></div>
+          </div>
         </div>
-        <div><label className="block text-[11px] text-zinc-400 mb-1 font-sans">WhatsApp Number (E.164)</label><input type="text" required value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+919876543210" className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-indigo-500 font-sans" /></div>
-        {err && <div className="rounded-xl border border-rose-800/50 bg-rose-950/30 p-3 text-center"><p className="text-xs text-rose-400 font-sans">{err}</p></div>}
-        <button type="submit" disabled={busy} className="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 py-3.5 text-xs font-bold uppercase tracking-wider text-white transition-all disabled:opacity-50 cursor-pointer shadow-md font-sans">{busy ? <Loader2 size={14} className="animate-spin" /> : <UserPlus size={14} />} <span>{busy ? "Provisioning..." : "Onboard User"}</span></button>
+        
+        <div className="grid grid-cols-2 gap-4">
+          <div className="bg-indigo-50/40 p-4 rounded-2xl border border-indigo-100 shadow-sm">
+            <label className="block text-[10px] font-bold text-indigo-500 uppercase tracking-widest font-mono mb-2">Shift Start Delay Lock</label>
+            <div className="flex items-center gap-2"><input type="number" min={0} required value={form?.lockoutStartMin ?? 60} onChange={e => setForm({...form, lockoutStartMin: Number(e.target.value)})} className="w-full bg-transparent font-black text-indigo-700 font-mono text-lg outline-none" /><span className="text-indigo-400 font-mono font-bold">Mins</span></div>
+            <span className="text-[10px] text-slate-500 block mt-2 font-medium">Freezes breaks right after clock-in</span>
+          </div>
+          <div className="bg-rose-50/40 p-4 rounded-2xl border border-rose-100 shadow-sm">
+            <label className="block text-[10px] font-bold text-rose-500 uppercase tracking-widest font-mono mb-2">Shift End Margin Lock</label>
+            <div className="flex items-center gap-2"><input type="number" min={0} required value={form?.lockoutEndMin ?? 60} onChange={e => setForm({...form, lockoutEndMin: Number(e.target.value)})} className="w-full bg-transparent font-black text-rose-700 font-mono text-lg outline-none" /><span className="text-rose-400 font-mono font-bold">Mins</span></div>
+            <span className="text-[10px] text-slate-500 block mt-2 font-medium">Freezes breaks before shift handover</span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-4">
+          <div className="bg-white/60 p-4 rounded-2xl border border-slate-200/60 shadow-sm">
+            <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest font-mono mb-2">Max Floor Concurrency</label>
+            <div className="flex items-center gap-2"><input type="number" min={1} required value={form?.maxConcurrentBreaks ?? 2} onChange={e => setForm({...form, maxConcurrentBreaks: Number(e.target.value)})} className="w-full bg-transparent font-black text-slate-900 font-mono text-lg outline-none" /><span className="text-slate-400 font-mono font-bold">Agents</span></div>
+          </div>
+          <div className="bg-white/60 p-4 rounded-2xl border border-slate-200/60 shadow-sm">
+            <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest font-mono mb-2">Standard Shift Span</label>
+            <div className="flex items-center gap-2"><input type="number" min={1} required value={form?.shiftDurationHours ?? 9} onChange={e => setForm({...form, shiftDurationHours: Number(e.target.value)})} className="w-full bg-transparent font-black text-slate-900 font-mono text-lg outline-none" /><span className="text-slate-400 font-mono font-bold">Hours</span></div>
+          </div>
+        </div>
+        
+        <button type="submit" disabled={busy} className="btn-glass w-full font-black py-4 mt-2 rounded-2xl text-xs uppercase tracking-widest cursor-pointer shadow-md active:scale-[0.99] disabled:opacity-50">
+          Deploy Ledger Configurations
+        </button>
       </form>
     </div>
   );
 }
 
-function ConfigSection({ currentSettings }) {
-  const [form, setForm] = useState(currentSettings); const [busy, setBusy] = useState(false); const [saved, setSaved] = useState(false);
-  useEffect(() => { setForm(currentSettings); }, [currentSettings]);
-  const handleSave = async () => { setBusy(true); setSaved(false); try { await setDoc(doc(db, "break_settings", "config"), { ...form, updatedAt: serverTimestamp() }, { merge: true }); setSaved(true); setTimeout(() => setSaved(false), 3500); } finally { setBusy(false); } };
-  return (<div className="rounded-3xl border border-zinc-800 bg-zinc-900/40 p-7 shadow-xl space-y-4 font-mono"><div className="flex items-center justify-between border-b border-zinc-800 pb-4"><div className="flex items-center gap-2"><Sliders size={14} className="text-indigo-400" /><h2 className="text-xs font-bold uppercase tracking-wider text-white font-sans">System Settings</h2></div>{saved ? <span className="text-[10px] font-bold text-emerald-400">✓ SAVED</span> : <span className="text-[10px] text-zinc-500 uppercase">Global</span>}</div><button type="button" disabled={busy} onClick={handleSave} className="w-full bg-zinc-800 hover:bg-zinc-700 text-white font-bold py-3 rounded-xl text-xs uppercase cursor-pointer">Save Settings</button></div>);
-}
+function AdminUserRow({ user, livePresence, onEdit, isSuperAdmin }) {
+  const [busy, setBusy] = useState(false); 
+  const [newPass, setNewPass] = useState(null);
+  
+  let projectedStatus = "OFFLINE"; 
+  let effWorkMode = user.workMode || "WFO";
+  
+  if (livePresence) {
+    projectedStatus = (livePresence.status === "OFFLINE" || !livePresence.status) 
+      ? (user.role === "AGENT" ? "AVAILABLE" : "ONLINE") : livePresence.status;
+    if (livePresence.workMode) effWorkMode = livePresence.workMode;
+  }
 
-// ⚡ 3. THE MATRIX ROSTER SECTION (Role x Tenant Filter!)
-function RosterSection({ users, livePresences, projectsList, onEditEmployee }) {
-  const [activeTab, setActiveTab] = useState("AGENT"); 
-  const [selectedTenant, setSelectedTenant] = useState("ALL"); // "ALL", "GENERAL", "BENTLEY"...
-  const [search, setSearch] = useState("");
+  const isTargetSuperAdmin = user.role === "SUPER_ADMIN" || (user.role === "ADMIN" && ["ROOT", "ALL", "GENERAL"].includes((user.project || "GENERAL").toUpperCase()));
+  const canEdit = isSuperAdmin || !isTargetSuperAdmin;
 
-  const roleCounts = useMemo(() => ({ AGENT: users.filter(u => u.role === "AGENT").length, SUPERVISOR: users.filter(u => u.role === "SUPERVISOR").length, ADMIN: users.filter(u => u.role === "ADMIN").length }), [users]);
-
-  // ⚡ THE 2-WAY MATRIX INTERSECT FILTER
-  const displayedUsers = useMemo(() => {
-    return users
-      .filter(u => u.role === activeTab)
-      .filter(u => selectedTenant === "ALL" || (u.project || "GENERAL").toUpperCase() === selectedTenant.toUpperCase())
-      .filter(u => {
-        if (!search) return true;
-        const q = search.toLowerCase();
-        return u.name?.toLowerCase().includes(q) || u.employeeId?.toLowerCase().includes(q) || u.project?.toLowerCase().includes(q);
-      });
-  }, [users, activeTab, selectedTenant, search]);
+  const handleReset = async () => { 
+    setBusy(true); 
+    try { 
+      const res = await httpsCallable(functions, "resetPassword")({ targetUid: user.uid || user.id }); 
+      setNewPass(res.data?.password); 
+    } catch(e) { alert(e.message); } finally { setBusy(false); } 
+  };
+  
+  const handleRemove = async () => { 
+    if (!confirm(`Permanently remove ${user.name}?`)) return; 
+    setBusy(true); 
+    try { 
+      await httpsCallable(functions, "deleteUserAccount")({ targetUid: user.uid || user.id }); 
+    } catch(e) { alert(e.message); } finally { setBusy(false); } 
+  };
 
   return (
-    <div className="rounded-3xl border border-zinc-800 bg-zinc-900/40 p-7 shadow-xl font-sans space-y-5">
+    <tr className="hover:bg-slate-50/80 transition-colors font-sans border-b border-slate-100 last:border-0">
+      <td className="py-3.5 pl-5">
+        <p className="font-bold text-slate-900 text-xs flex items-center gap-2">
+          <span>{user.name}</span> 
+          <span className="bg-indigo-50 border border-indigo-100 text-indigo-700 font-mono font-bold text-[9px] px-1.5 py-0.5 rounded shadow-sm">{effWorkMode}</span>
+        </p>
+        <span className="font-mono text-[11px] text-slate-400 font-medium block mt-1">{user.employeeId}</span>
+      </td>
+      <td className="py-3.5 px-3 font-mono">
+        <span className={`px-2.5 py-1 rounded-md border text-[10px] uppercase font-black tracking-wider ${user.role === "SUPER_ADMIN" || user.role === "ADMIN" ? "bg-rose-50 border-rose-200 text-rose-700" : user.role === "SUPERVISOR" ? "bg-indigo-50 border-indigo-200 text-indigo-700" : "bg-emerald-50 border-emerald-200 text-emerald-700"}`}>
+          {user.role === "SUPER_ADMIN" ? "SUPER ADM" : user.role}
+        </span>
+      </td>
+      <td className="py-3.5 px-3 font-mono font-bold text-indigo-600">{user.project || "GENERAL"}</td>
+      <td className="py-3.5 px-3"><UserStatusBadge status={projectedStatus} /></td>
       
-      {/* Top Row: Role Tabs */}
-      <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between border-b border-zinc-800 pb-5">
-        <div className="flex items-center gap-2.5 font-mono"><Database size={15} className="text-indigo-400" /><h2 className="text-xs font-bold uppercase tracking-wider text-white">Workforce Directory</h2></div>
-        <div className="flex items-center gap-1 bg-zinc-950 p-1 rounded-xl border border-zinc-800 font-mono text-xs">
-          <TabButton active={activeTab === "AGENT"} onClick={() => { setActiveTab("AGENT"); }} label={`Agents (${roleCounts.AGENT})`} />
-          <TabButton active={activeTab === "SUPERVISOR"} onClick={() => { setActiveTab("SUPERVISOR"); }} label={`Supervisors (${roleCounts.SUPERVISOR})`} />
-          <TabButton active={activeTab === "ADMIN"} onClick={() => { setActiveTab("ADMIN"); }} label={`Admins (${roleCounts.ADMIN})`} />
-        </div>
-      </div>
-
-      {/* ⚡ Second Row: TENANT DROPDOWN + SEARCH BAR */}
-      <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 font-mono">
-        <div className="sm:col-span-5 flex items-center gap-2 bg-zinc-950 px-3 py-2 rounded-xl border border-zinc-800">
-          <Filter size={13} className="text-amber-400 shrink-0" />
-          <select 
-            value={selectedTenant} onChange={e => setSelectedTenant(e.target.value)}
-            className="w-full bg-transparent text-xs font-bold text-amber-400 outline-none cursor-pointer"
-          >
-            <option value="ALL" className="bg-zinc-900 text-zinc-200">🌍 ALL TENANTS</option>
-            {projectsList.map(p => <option key={p} value={p} className="bg-zinc-900 text-zinc-200">{p}</option>)}
-          </select>
-        </div>
-
-        <div className="sm:col-span-7 relative">
-          <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 text-zinc-500" size={14} />
-          <input 
-            type="text" value={search} onChange={(e) => setSearch(e.target.value)} 
-            placeholder={`Search ${selectedTenant === "ALL" ? "" : selectedTenant} ${activeTab.toLowerCase()}s...`}
-            className="w-full bg-zinc-950 border border-zinc-800 rounded-xl py-2 pl-9 pr-4 text-xs text-zinc-100 placeholder-zinc-600 outline-none focus:border-indigo-500 font-sans"
-          />
-        </div>
-      </div>
-
-      <div className="overflow-x-auto rounded-xl border border-zinc-800 bg-zinc-950/60 shadow-inner">
-        <table className="w-full text-left border-collapse font-sans">
-          <thead className="border-b border-zinc-800 bg-zinc-900/60 font-mono text-[10px] font-bold uppercase tracking-wider text-zinc-400">
-            <tr><th className="py-3.5 pl-5 pr-3">Employee</th><th className="py-3.5 px-3">Project Tenant</th><th className="py-3.5 px-3">Live Status</th><th className="py-3.5 pl-3 pr-5 text-right">Actions</th></tr>
-          </thead>
-          <tbody className="divide-y divide-zinc-800/60 text-xs font-medium text-zinc-300">
-            {displayedUsers.length === 0 ? (
-              <tr><td colSpan={4} className="py-12 text-center text-zinc-600 font-mono">No {selectedTenant === "ALL" ? "" : selectedTenant} {activeTab.toLowerCase()} records found.</td></tr>
+      <td className="py-3.5 text-right pr-5">
+        {canEdit ? (
+          <div className="flex items-center justify-end gap-1.5">
+            <button onClick={onEdit} className="btn-soft text-slate-600 hover:text-indigo-600 p-2 rounded-xl cursor-pointer">
+              <Edit size={14} />
+            </button>
+            {newPass ? (
+              <span className="bg-emerald-50 text-emerald-700 border border-emerald-200 px-3 py-1.5 rounded-xl font-mono font-bold text-xs shadow-sm">{newPass}</span>
             ) : (
-              displayedUsers.map((u) => <UserRow key={u.id} user={u} isLiveOnline={livePresences.has(u.uid || u.id)} onEdit={() => onEditEmployee(u)} />)
+              <button disabled={busy} onClick={handleReset} className="btn-soft px-3 py-1.5 rounded-xl font-bold text-xs cursor-pointer">Reset</button>
             )}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-function TabButton({ active, onClick, label }) {
-  const activeCls = active ? "bg-indigo-600 text-white font-bold border-indigo-500 shadow-sm" : "text-zinc-500 hover:text-zinc-300 border-transparent font-normal";
-  return <button onClick={onClick} className={`px-3 py-1.5 rounded-lg border transition-all cursor-pointer font-sans ${activeCls}`}>{label}</button>;
-}
-
-function UserRow({ user, isLiveOnline, onEdit }) {
-  const [busy, setBusy] = useState(false); const [newPass, setNewPass] = useState(null);
-  const handleReset = async () => { if (!confirm(`Reset password for ${user.name}?`)) return; setBusy(true); setNewPass(null); try { const res = await httpsCallable(functions, "resetPassword")({ targetUid: user.uid }); setNewPass(res.data.password); } finally { setBusy(false); } };
-  const handleRemove = async () => { if (!confirm(`Permanently delete ${user.name}?`)) return; setBusy(true); try { await httpsCallable(functions, "deleteUserAccount")({ targetUid: user.uid }); } catch (e) { alert("Delete failed: " + e.message); setBusy(false); } };
-
-  let projectedStatus = user.status || "OFFLINE";
-  if (isLiveOnline && projectedStatus === "OFFLINE") projectedStatus = user.role === "AGENT" ? "AVAILABLE" : "ONLINE";
-  else if (!isLiveOnline) projectedStatus = "OFFLINE";
-
-  return (
-    <tr className="hover:bg-zinc-900/50 transition-colors font-sans">
-      <td className="py-3.5 pl-5 pr-3"><p className="font-bold text-white text-xs font-sans">{user.name}</p><span className="font-mono text-[11px] text-indigo-400 font-bold block">{user.employeeId} <span className="text-zinc-600 font-sans font-normal">· {user.phone}</span></span></td>
-      <td className="py-3.5 px-3 font-mono font-bold text-amber-400">{user.project || "GENERAL"}</td>
-      <td className="py-3.5 px-3 font-sans"><UserStatusBadge status={projectedStatus} /></td>
-      <td className="py-3.5 pl-3 pr-5 text-right font-sans">
-        <div className="flex items-center justify-end gap-1 font-sans">
-          <button onClick={onEdit} className="bg-zinc-800 hover:bg-indigo-600 hover:text-white text-zinc-300 p-1.5 rounded cursor-pointer transition-all active:scale-95" title="Edit Profile"><Edit size={13} /></button>
-          {newPass ? <span className="bg-zinc-900 px-2 py-1 rounded border border-emerald-500 text-emerald-400 font-mono font-bold text-xs">{newPass}</span> : <button disabled={busy} onClick={handleReset} className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-2.5 py-1 rounded cursor-pointer text-xs font-medium transition-all active:scale-95 font-sans">Reset</button>}
-          {user.role !== "ADMIN" && <button disabled={busy} onClick={handleRemove} className="bg-rose-500/10 hover:bg-rose-600 hover:text-white text-rose-400 border border-rose-500/30 p-1.5 rounded cursor-pointer transition-all active:scale-95 ml-0.5"><Trash2 size={13} /></button>}
-        </div>
+            {user.role !== "SUPER_ADMIN" && (
+              <button disabled={busy} onClick={handleRemove} className="text-slate-400 hover:text-rose-600 p-2 rounded-xl hover:bg-rose-50 transition-colors cursor-pointer">
+                <Trash2 size={14} />
+              </button>
+            )}
+          </div>
+        ) : (
+          <span className="text-[9px] font-black text-slate-400 font-mono tracking-widest px-2.5 py-1 bg-slate-50 border border-slate-200 rounded-md">RESTRICTED</span>
+        )}
       </td>
     </tr>
   );
 }
 
 function UserStatusBadge({ status }) {
-  const map = { ONLINE: { text: "Online", cls: "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" }, AVAILABLE: { text: "Available", cls: "bg-emerald-500/10 text-emerald-400 border-emerald-500/30 font-semibold" }, IN_QUEUE: { text: "In Queue", cls: "bg-amber-500/10 text-amber-400 border-amber-500/30" }, ON_BREAK: { text: "On Break", cls: "bg-amber-400/15 text-amber-300 border-amber-400/40 animate-pulse font-bold" }, BREAK_EXCEEDED: { text: "Over Limit", cls: "bg-rose-500/20 text-rose-400 border-rose-500/40 animate-bounce font-black" }, OFFLINE: { text: "Offline", cls: "bg-zinc-800/40 text-zinc-500 border-zinc-700/50 font-normal" } };
-  const b = map[status] || map.OFFLINE;
-  return <span className={`px-2 py-0.5 rounded text-[10px] font-mono border uppercase tracking-wider inline-block ${b.cls}`}>{b.text}</span>;
+  const map = { 
+    ONLINE: { text: "Online", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" }, 
+    AVAILABLE: { text: "Available", cls: "bg-emerald-50 text-emerald-700 border-emerald-200 font-bold" }, 
+    IN_QUEUE: { text: "In Queue", cls: "bg-indigo-50 text-indigo-700 border-indigo-200" }, 
+    ON_BREAK: { text: "On Break", cls: "bg-amber-50 text-amber-700 border-amber-200 font-bold animate-pulse" }, 
+    BREAK_EXCEEDED: { text: "Over Limit", cls: "bg-rose-50 text-rose-700 border-rose-200 font-black animate-ping" }, 
+    OFFLINE: { text: "Offline", cls: "bg-slate-100 text-slate-400 border-slate-200 font-medium" } 
+  };
+  const b = map[status] || map.OFFLINE; 
+  return <span className={`px-2.5 py-1 rounded-full text-[9px] font-black font-mono border uppercase tracking-wider inline-block ${b.cls}`}>{b.text}</span>;
 }
 
-function EditEmployeeModal({ user, projectsList, onClose }) {
-  const [name, setName] = useState(user?.name || ""); const [phone, setPhone] = useState(user?.phone || "");
-  const [role, setRole] = useState(user?.role || "AGENT"); const [project, setProject] = useState(user?.project || "GENERAL");
-  const [busy, setBusy] = useState(false);
-
-  const handleSaveChanges = async (e) => {
-    e.preventDefault(); setBusy(true);
-    try { await httpsCallable(functions, "editUserAccount")({ targetUid: user.uid || user.id, name, phone, role, project }); onClose(); } 
-    catch (err) { alert("Profile mutation failed: " + err.message); setBusy(false); }
+function AdminProvisionModal({ projectsList, onClose, isSuperAdmin, myProject }) {
+  const [name, setName] = useState(""); const [phone, setPhone] = useState(""); const [role, setRole] = useState("AGENT"); 
+  const [project, setProject] = useState(isSuperAdmin ? (projectsList[0] || "GENERAL") : myProject); 
+  const [busy, setBusy] = useState(false); const [spawned, setSpawned] = useState(null);
+  
+  const submit = async (e) => { 
+    e.preventDefault(); setBusy(true); 
+    try { 
+      const res = await httpsCallable(functions, "createUserAccount")({ name: name.trim(), role, phone: phone.trim(), project }); 
+      setSpawned(res.data); setName(""); setPhone(""); 
+    } catch(e) { alert(e.message); } finally { setBusy(false); } 
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-4 font-sans animate-in fade-in duration-200">
-      <div className="w-full max-w-md rounded-3xl border border-zinc-800 bg-zinc-900 p-7 shadow-2xl space-y-5"><div className="flex items-center justify-between border-b border-zinc-800 pb-3.5 font-mono"><div className="flex items-center gap-2 text-indigo-400 font-bold text-sm"><Edit size={16} /> <span className="font-sans">Edit Profile</span></div><button onClick={onClose} className="text-zinc-500 hover:text-white cursor-pointer"><X size={16}/></button></div><div className="bg-zinc-950 px-3.5 py-2.5 rounded-xl border border-zinc-800 font-mono text-xs flex justify-between text-zinc-400"><span>ID: <strong className="text-indigo-300">{user.employeeId}</strong></span><span>Tenant: <strong className="text-amber-400">{user.project || "GENERAL"}</strong></span></div><form onSubmit={handleSaveChanges} className="space-y-4 font-sans"><div><label className="block text-[10px] font-bold uppercase text-zinc-400 mb-1 font-mono">Display Name</label><input type="text" required value={name} onChange={e => setName(e.target.value)} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3.5 py-2.5 text-xs text-white font-bold outline-none focus:border-indigo-500 font-sans"/></div><div className="grid grid-cols-2 gap-3.5 font-sans"><div><label className="block text-[10px] font-bold uppercase text-zinc-400 mb-1 font-mono">Clearance</label><select value={role} onChange={e => setRole(e.target.value)} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2.5 text-xs font-bold text-indigo-300 outline-none focus:border-indigo-500 cursor-pointer font-sans"><option value="AGENT">Shift Agent</option><option value="SUPERVISOR">Supervisor</option><option value="ADMIN">Administrator</option></select></div><div><label className="block text-[10px] font-bold uppercase text-zinc-400 mb-1 font-mono">Tenant</label><select value={project} onChange={e => setProject(e.target.value)} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2.5 text-xs font-mono font-bold text-amber-400 outline-none focus:border-indigo-500 cursor-pointer font-sans">{projectsList.map(p => <option key={p} value={p}>{p}</option>)}</select></div></div><div><label className="block text-[10px] font-bold uppercase text-zinc-400 mb-1 font-mono">WhatsApp (E.164)</label><input type="text" required value={phone} onChange={e => setPhone(e.target.value)} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3.5 py-2.5 text-xs text-white font-bold outline-none focus:border-indigo-500 font-sans"/></div><div className="pt-2"><button type="submit" disabled={busy} className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-3.5 rounded-xl text-xs uppercase tracking-wider cursor-pointer disabled:opacity-50 font-sans">{busy ? "Updating..." : "Save Profile Changes"}</button></div></form></div>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4 animate-in fade-in font-sans">
+      <div className="glass w-full max-w-md rounded-[32px] p-8 space-y-6 animate-rise shadow-2xl bg-white/95">
+        <div className="flex justify-between items-center border-b border-slate-200/80 pb-4 font-mono font-bold text-xs text-indigo-600">
+          <span className="flex items-center gap-2"><UserPlus size={16} /> Provision New {isSuperAdmin ? "Global User" : "Tenant Member"}</span>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-700 cursor-pointer"><X size={18} /></button>
+        </div>
+        
+        {spawned ? (
+          <div className="p-6 bg-emerald-50 border border-emerald-200 rounded-2xl font-mono text-xs space-y-3 animate-rise shadow-inner">
+            <div className="font-black text-emerald-800 text-base mb-3 border-b border-emerald-200/60 pb-3">✓ Account Deployed</div>
+            <div className="flex justify-between text-emerald-900 text-sm"><span className="text-emerald-700/80">ID:</span> <strong className="bg-white px-2 py-0.5 rounded shadow-sm">{spawned.employeeId}</strong></div>
+            <div className="flex justify-between text-emerald-900 text-sm"><span className="text-emerald-700/80">Pass:</span> <strong className="bg-white px-2 py-0.5 rounded shadow-sm">{spawned.password}</strong></div>
+            <button onClick={onClose} className="btn-glass mt-5 w-full py-4 rounded-xl text-xs font-black uppercase tracking-wider cursor-pointer font-sans shadow-md">Acknowledge & Close</button>
+          </div>
+        ) : (
+          <form onSubmit={submit} className="space-y-5">
+            <div>
+              <label className="block text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-2 font-mono">Display Name</label>
+              <input type="text" required value={name} onChange={e => setName(e.target.value)} className="input-glass w-full rounded-2xl p-4 text-sm text-slate-900 font-bold outline-none font-sans" />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-2 font-mono">Role Clearance</label>
+                <select value={role} onChange={e => setRole(e.target.value)} className="input-glass w-full rounded-2xl p-3.5 text-xs font-bold text-indigo-600 outline-none cursor-pointer font-mono">
+                  <option value="AGENT">Agent</option>
+                  <option value="SUPERVISOR">Supervisor</option>
+                  <option value="ADMIN">Project Admin</option>
+                  {isSuperAdmin && <option value="SUPER_ADMIN">Super Admin</option>}
+                </select>
+              </div>
+              <div>
+                <label className="block text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-2 font-mono">Project Tenant</label>
+                {isSuperAdmin ? (
+                  <select value={project} onChange={e => setProject(e.target.value)} className="input-glass w-full rounded-2xl p-3.5 text-xs font-mono font-bold text-amber-600 outline-none cursor-pointer">
+                    {projectsList.map(p => <option key={p} value={p}>{p}</option>)}
+                  </select>
+                ) : (
+                  <div className="w-full rounded-2xl p-3.5 text-xs font-mono font-bold text-slate-500 bg-slate-50 border border-slate-200 flex items-center justify-between"><Building2 size={14}/>{myProject}</div>
+                )}
+              </div>
+            </div>
+            <div>
+              <label className="block text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-2 font-mono">WhatsApp Number</label>
+              <input type="text" required value={phone} onChange={e => setPhone(e.target.value)} placeholder="+91..." className="input-glass w-full rounded-2xl p-4 text-sm text-slate-900 font-bold outline-none font-sans" />
+            </div>
+            <button type="submit" disabled={busy} className="btn-glass w-full font-black py-4 rounded-2xl text-xs uppercase tracking-wider cursor-pointer disabled:opacity-50 font-sans mt-3">
+              {busy ? "Provisioning..." : "Create Workforce Account"}
+            </button>
+          </form>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EditEmployeeModal({ user, projectsList, onClose, isSuperAdmin, myProject }) {
+  const [name, setName] = useState(user?.name || ""); 
+  const [phone, setPhone] = useState(user?.phone || ""); 
+  const [role, setRole] = useState(user?.role || "AGENT"); 
+  const [project, setProject] = useState(user?.project || "GENERAL"); 
+  const [busy, setBusy] = useState(false);
+  
+  const handleSaveChanges = async (e) => { 
+    e.preventDefault(); setBusy(true); 
+    try { await httpsCallable(functions, "editUserAccount")({ targetUid: user.uid || user.id, name, phone, role, project }); onClose(); } 
+    catch (err) { alert(err.message); setBusy(false); } 
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4 animate-in fade-in font-sans">
+      <div className="glass w-full max-w-md rounded-[32px] p-8 space-y-6 animate-rise shadow-2xl bg-white/95">
+        <div className="flex justify-between items-center border-b border-slate-200/80 pb-4 font-mono font-bold text-xs text-indigo-600">
+          <span className="flex items-center gap-2"><Edit size={16} /> Edit Workforce Profile</span>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-700 cursor-pointer"><X size={18} /></button>
+        </div>
+        
+        <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200 font-mono text-xs flex justify-between text-slate-500 shadow-inner">
+          <span className="flex items-center gap-1.5">ID: <strong className="text-indigo-600 bg-white px-2 py-0.5 rounded shadow-sm border border-slate-100">{user.employeeId}</strong></span>
+          <span className="flex items-center gap-1.5"><Building2 size={13} /> Tenant: <strong className="text-slate-800">{user.project || "GENERAL"}</strong></span>
+        </div>
+        
+        <form onSubmit={handleSaveChanges} className="space-y-5">
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-2 font-mono">Display Name</label>
+            <input type="text" required value={name} onChange={e => setName(e.target.value)} className="input-glass w-full rounded-2xl p-4 text-sm text-slate-900 font-bold outline-none font-sans" />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-2 font-mono">Role Clearance</label>
+              <select value={role} onChange={e => setRole(e.target.value)} className="input-glass w-full rounded-2xl p-3.5 text-xs font-bold text-indigo-600 outline-none cursor-pointer font-mono">
+                <option value="AGENT">Agent</option>
+                <option value="SUPERVISOR">Supervisor</option>
+                <option value="ADMIN">Project Admin</option>
+                {isSuperAdmin && <option value="SUPER_ADMIN">Super Admin</option>}
+              </select>
+            </div>
+            <div>
+              <label className="block text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-2 font-mono">Project Tenant</label>
+              {isSuperAdmin ? (
+                <select value={project} onChange={e => setProject(e.target.value)} className="input-glass w-full rounded-2xl p-3.5 text-xs font-mono font-bold text-amber-600 outline-none cursor-pointer">
+                  {projectsList.map(p => <option key={p} value={p}>{p}</option>)}
+                </select>
+              ) : (
+                <div className="w-full rounded-2xl p-3.5 text-xs font-mono font-bold text-slate-500 bg-slate-50 border border-slate-200 flex items-center justify-between"><Lock size={14}/>{myProject}</div>
+              )}
+            </div>
+          </div>
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-2 font-mono">WhatsApp Number</label>
+            <input type="text" required value={phone} onChange={e => setPhone(e.target.value)} className="input-glass w-full rounded-2xl p-4 text-sm text-slate-900 font-bold outline-none font-sans" />
+          </div>
+          
+          <button type="submit" disabled={busy} className="btn-glass w-full font-black py-4 rounded-2xl text-xs uppercase tracking-wider cursor-pointer font-sans mt-3">
+            {busy ? "Saving..." : "Commit Profile Changes"}
+          </button>
+        </form>
+      </div>
     </div>
   );
 }
