@@ -9,8 +9,6 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState(null);
 
-  // ⚡ RAW AUTHENTICATION: No complex Firestore routing here. 
-  // Once auth state changes, App.jsx automatically mounts the WFH Gate!
   const handleLogin = async (e) => {
     e.preventDefault();
     if (!empId || !pass) return;
@@ -29,7 +27,6 @@ export default function LoginPage() {
 
   return (
     <div className="relative min-h-screen flex flex-col justify-between font-sans text-slate-800 selection:bg-indigo-500 selection:text-white">
-      {/* Expensive ambient background */}
       <div className="mesh-bg"><span className="mesh-orb" /></div>
 
       <header className="relative z-10 p-6 max-w-7xl mx-auto w-full flex justify-between items-center animate-rise">
@@ -39,18 +36,19 @@ export default function LoginPage() {
         </div>
         <div className="glass flex items-center gap-1.5 text-xs font-bold text-emerald-700 px-3.5 py-1.5 rounded-full">
           <ShieldCheck size={14} className="text-emerald-600" />
-          <span>Capgemini Enterprise Gate</span>
+          <span className="hidden sm:inline">Capgemini Enterprise Gate</span>
+          <span className="sm:hidden">Enterprise Gate</span>
         </div>
       </header>
 
       <main className="relative z-10 flex-1 flex items-center justify-center p-6">
-        <div className="glass animate-rise delay-1 w-full max-w-md rounded-[34px] p-9 space-y-7">
+        <div className="glass animate-rise delay-1 w-full max-w-md rounded-[34px] p-8 sm:p-9 space-y-7">
           
           <div className="text-center space-y-2">
             <div className="inline-flex p-3.5 rounded-2xl text-indigo-600 mb-1 bg-white/60 border border-white/70 shadow-inner glow-pulse">
               <Sparkles size={24} />
             </div>
-            <h2 className="text-[26px] font-black text-slate-900 tracking-tight">Access Control Center</h2>
+            <h2 className="text-2xl sm:text-[26px] font-black text-slate-900 tracking-tight">Access Control Center</h2>
             <p className="text-xs text-slate-500 font-medium">Authenticate with your assigned pseudonymous ID</p>
           </div>
 
@@ -94,7 +92,7 @@ export default function LoginPage() {
             <button 
               type="submit" 
               disabled={loading}
-              className="btn-glass mt-2 w-full font-black py-4 rounded-2xl text-xs uppercase tracking-wider flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+              className="btn-glass mt-2 w-full font-black py-4 rounded-2xl text-xs uppercase tracking-wider flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 active:scale-95 transition-transform"
             >
               {loading ? <Loader2 size={16} className="animate-spin" /> : (
                 <>
