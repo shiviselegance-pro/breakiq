@@ -10,6 +10,7 @@ setGlobalOptions({
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const admin = require("firebase-admin");
+const axios = require("axios"); // ⚡ Used for WhatsApp API Gateway
 
 admin.initializeApp();
 const db = admin.firestore();
@@ -17,6 +18,9 @@ const FieldValue = admin.firestore.FieldValue;
 const Timestamp = admin.firestore.Timestamp;
 
 const ORG_DOMAIN = "breakapp.internal";
+const WHATSAPP_GATEWAY_URL = "https://wa-gateway-production-aaa5.up.railway.app/send-message"; 
+const WHATSAPP_TOKEN = "ARES_SECRET_WA_KEY_2026";
+
 const DEFAULT_SETTINGS = {
   shiftDurationHours: 9, 
   mealBreakMin: 40, 
@@ -29,45 +33,97 @@ const DEFAULT_SETTINGS = {
 };
 
 // ============================================================================
+// ⚡ WHATSAPP ROUTING ENGINE
+// ============================================================================
+
+async function sendWhatsAppAlert(toPhone, messageText) {
+  if (!toPhone || !messageText) return false;
+
+  let formattedPhone = toPhone.trim().replace(/[+\s-]/g, "");
+  if (!formattedPhone.startsWith("91") && formattedPhone.length === 10) {
+    formattedPhone = "91" + formattedPhone;
+  }
+
+  console.log(`📤 Attempting WA send to: ${formattedPhone}`);
+
+  try {
+    const response = await axios.post(WHATSAPP_GATEWAY_URL, {
+      token: WHATSAPP_TOKEN,
+      phone: formattedPhone,
+      message: messageText
+    }, {
+      headers: { "Content-Type": "application/json" },
+      timeout: 8000 
+    });
+
+    if (response.status === 200) {
+      console.log(`✅ WA Alert Sent to ${formattedPhone}`);
+      return true;
+    }
+    console.warn(`⚠️ WA Response not 200: ${response.status}`);
+    return false;
+  } catch (error) {
+    console.error(`❌ WA Node Failed for ${formattedPhone}:`, error.message);
+    return false;
+  }
+}
+
+async function getManagementContacts(projectId) {
+  const contacts = [];
+  try {
+    console.log(`🔍 Searching supervisors/admins for project: ${projectId}`);
+    const snap = await db.collection("users")
+      .where("project", "==", projectId)
+      .where("role", "in", ["SUPERVISOR", "ADMIN", "SUPER_ADMIN"])
+      .get();
+
+    console.log(`📋 Raw query returned ${snap.size} documents`);
+
+    snap.forEach(docSnap => {
+      const u = docSnap.data();
+      console.log(`   → Found: ${u.name} | role: ${u.role} | active: ${u.active} | phone: ${u.phone}`);
+      if (u.phone && u.active) {
+        contacts.push(u.phone);
+      } else {
+        console.warn(`   ⚠️ Skipped ${u.name}: phone=${u.phone}, active=${u.active}`);
+      }
+    });
+
+    console.log(`✅ Final contact list for ${projectId}:`, contacts);
+  } catch (err) {
+    console.error("Error fetching management routing roster:", err);
+  }
+  return contacts;
+}
+
+// ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
 function assertAuth(request) {
-  if (!request.auth) {
-    throw new HttpsError("unauthenticated", "Strict IAM sign-in required.");
-  }
+  if (!request.auth) throw new HttpsError("unauthenticated", "Strict IAM sign-in required.");
   return request.auth.uid;
 }
 
 async function getSettings(project) {
   let finalConfig = { ...DEFAULT_SETTINGS };
-  
   const legacySnap = await db.doc("break_settings/config").get();
-  if (legacySnap.exists) {
-    finalConfig = { ...finalConfig, ...legacySnap.data() };
-  }
+  if (legacySnap.exists) finalConfig = { ...finalConfig, ...legacySnap.data() };
   
   const genSnap = await db.doc("project_settings/GENERAL").get();
-  if (genSnap.exists) {
-    finalConfig = { ...finalConfig, ...genSnap.data() };
-  }
+  if (genSnap.exists) finalConfig = { ...finalConfig, ...genSnap.data() };
   
   const pStr = (project || "GENERAL").toUpperCase();
   if (pStr !== "GENERAL") {
     const pSnap = await db.doc(`project_settings/${pStr}`).get();
-    if (pSnap.exists) {
-      finalConfig = { ...finalConfig, ...pSnap.data() };
-    }
+    if (pSnap.exists) finalConfig = { ...finalConfig, ...pSnap.data() };
   }
-  
   return finalConfig;
 }
 
 async function getUserDoc(uid) {
   const snap = await db.doc(`users/${uid}`).get();
-  if (!snap.exists) {
-    throw new HttpsError("not-found", "User directory record missing.");
-  }
+  if (!snap.exists) throw new HttpsError("not-found", "User directory record missing.");
   return { id: snap.id, ...snap.data() };
 }
 
@@ -91,32 +147,23 @@ async function nextSeq(counterPath, field = "value") {
 function genPassword(length = 10) {
   const charset = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
   let out = "";
-  for (let i = 0; i < length; i++) {
-    out += charset[Math.floor(Math.random() * charset.length)];
-  }
+  for (let i = 0; i < length; i++) out += charset[Math.floor(Math.random() * charset.length)];
   return out;
 }
 
 function bumpBudget(budget, category, minutes) {
-  if (category === "MEAL") {
-    return { ...budget, mealUsedMin: budget.mealUsedMin + minutes };
-  }
+  if (category === "MEAL") return { ...budget, mealUsedMin: budget.mealUsedMin + minutes };
   return { ...budget, shortUsedMin: budget.shortUsedMin + minutes };
 }
 
 function windowCheck(shift, settings, atMillis) {
   const lockStart = Number(settings.lockoutStartMin) || 0;
   const lockEnd = Number(settings.lockoutEndMin) || 0;
-  
   const opensAt = shift.shiftStart.toMillis() + (lockStart * 60000);
   const closesAt = shift.shiftEnd.toMillis() - (lockEnd * 60000);
   
-  if (atMillis < (opensAt - 30000)) {
-    return { ok: false, reason: `Start Lock active for ${lockStart}m` };
-  }
-  if (atMillis > (closesAt + 30000)) {
-    return { ok: false, reason: `End Lock active for ${lockEnd}m` };
-  }
+  if (atMillis < (opensAt - 30000)) return { ok: false, reason: `Start Lock active for ${lockStart}m` };
+  if (atMillis > (closesAt + 30000)) return { ok: false, reason: `End Lock active for ${lockEnd}m` };
   return { ok: true };
 }
 
@@ -124,7 +171,6 @@ function windowCheck(shift, settings, atMillis) {
 // QUEUE HEALING & PROMOTION LOGIC
 // ============================================================================
 
-// ⚡ THE HEALER: Finds oldest agent in queue and PROMPTS them (NOTIFIED_TO_START)
 async function processQueue(projectId) {
   const settings = await getSettings(projectId);
   const max = settings.maxConcurrentBreaks || 2;
@@ -135,41 +181,29 @@ async function processQueue(projectId) {
     .where("status", "in", ["ON_BREAK", "NOTIFIED_TO_START"])
     .get();
 
-  if (activeSnap.size >= max) {
-    return; // Floor is currently full
-  }
+  if (activeSnap.size >= max) return; 
 
   const queueSnap = await db.collection("break_sessions")
     .where("project", "==", projectId)
     .where("status", "in", ["AWAITING_SLOT", "IN_QUEUE"])
     .get();
 
-  if (queueSnap.empty) {
-    return; // Nobody is waiting
-  }
+  if (queueSnap.empty) return;
 
-  // Find the oldest request
-  const sorted = queueSnap.docs.sort((a, b) => {
-    const aTime = a.data().requestedAt?.toMillis() || 0;
-    const bTime = b.data().requestedAt?.toMillis() || 0;
-    return aTime - bTime;
-  });
-  
+  const sorted = queueSnap.docs.sort((a, b) => (a.data().requestedAt?.toMillis() || 0) - (b.data().requestedAt?.toMillis() || 0));
   const headDoc = sorted[0];
 
   if (headDoc) {
     const pData = headDoc.data();
     
-    // Instead of auto-starting, prompt them!
-    await headDoc.ref.set({
-      status: "NOTIFIED_TO_START",
-      notifiedAt: now
-    }, { merge: true });
+    await headDoc.ref.set({ status: "NOTIFIED_TO_START", notifiedAt: now }, { merge: true });
+    await db.doc(`users/${pData.uid}`).set({ status: "NOTIFIED_TO_START", activeBreakId: headDoc.id }, { merge: true });
 
-    await db.doc(`users/${pData.uid}`).set({ 
-      status: "NOTIFIED_TO_START", 
-      activeBreakId: headDoc.id 
-    }, { merge: true });
+    // ⚡ WHATSAPP ALERT: Break is ready
+    const uSnap = await db.doc(`users/${pData.uid}`).get();
+    if (uSnap.exists && uSnap.data().phone) {
+      sendWhatsAppAlert(uSnap.data().phone, `🔔 BREAK READY: Hello ${pData.agentName}, your ${pData.breakCategory} break slot is ready! Please accept within 3 mins on your console.`);
+    }
   }
 }
 
@@ -197,36 +231,26 @@ async function endAndPromote(breakId, forcedBy) {
     wasForceEnded: !!forcedBy,
   }, { merge: true });
 
-  await db.doc(`users/${b.uid}`).set({ 
-    status: "AVAILABLE", 
-    activeBreakId: FieldValue.delete() 
-  }, { merge: true });
+  await db.doc(`users/${b.uid}`).set({ status: "AVAILABLE", activeBreakId: FieldValue.delete() }, { merge: true });
 
   if (refundMin > 0 && shiftSnap.exists) {
-    await shiftRef.set({ 
-      breakBudget: bumpBudget(shiftSnap.data().breakBudget, b.breakCategory, -refundMin) 
-    }, { merge: true });
+    await shiftRef.set({ breakBudget: bumpBudget(shiftSnap.data().breakBudget, b.breakCategory, -refundMin) }, { merge: true });
   }
 
-  // Call the healer to prompt the next agent
   await processQueue(b.project || "GENERAL");
   return { ok: true };
 }
 
-// ⚡ NEW AGENT CALLABLE: Agent clicks "Yes, Start Break" when prompted
 exports.acceptBreakStart = onCall(async (request) => {
   const uid = assertAuth(request);
   const user = await getUserDoc(uid);
   
-  if (!user.activeBreakId) {
-    throw new HttpsError("failed-precondition", "No pending session.");
-  }
+  if (!user.activeBreakId) throw new HttpsError("failed-precondition", "No pending session.");
 
   const breakRef = db.doc(`break_sessions/${user.activeBreakId}`);
   
   return db.runTransaction(async (tx) => {
     const bSnap = await tx.get(breakRef);
-    
     if (!bSnap.exists || bSnap.data().status !== "NOTIFIED_TO_START") {
       throw new HttpsError("failed-precondition", "Slot expired or invalid.");
     }
@@ -236,15 +260,10 @@ exports.acceptBreakStart = onCall(async (request) => {
     const intervalEnd = now.toMillis() + (b.requestedDurationMin * 60000);
 
     tx.set(breakRef, { 
-      status: "ON_BREAK", 
-      breakStartedAt: now, 
-      expectedEndAt: Timestamp.fromMillis(intervalEnd) 
+      status: "ON_BREAK", breakStartedAt: now, expectedEndAt: Timestamp.fromMillis(intervalEnd) 
     }, { merge: true });
     
-    tx.set(db.doc(`users/${uid}`), { 
-      status: "ON_BREAK" 
-    }, { merge: true });
-    
+    tx.set(db.doc(`users/${uid}`), { status: "ON_BREAK" }, { merge: true });
     return { ok: true };
   });
 });
@@ -411,6 +430,7 @@ exports.startShift = onCall(async (request) => {
     const existing = await db.doc(`shift_sessions/${user.activeShiftId}`).get();
     if (existing.exists && existing.data().status === "ON_SHIFT" && existing.data().shiftEnd.toMillis() > now.toMillis()) {
       await db.doc(`users/${uid}`).set({ status: "AVAILABLE" }, { merge: true });
+      console.log(`↩️ Shift resumed for ${user.name}, skipping WA alert.`);
       return { shiftId: user.activeShiftId, resumed: true };
     }
   }
@@ -440,7 +460,33 @@ exports.startShift = onCall(async (request) => {
     activeShiftId: shiftId, 
     status: "AVAILABLE" 
   }, { merge: true });
+
+  // ============================================================
+  // ⚡ WHATSAPP ALERT: Notify Management about agent login
+  // FIXED: Using await so Firebase doesn't kill the thread early
+  // ============================================================
+  console.log(`🚀 startShift: New shift created for ${user.name} in project ${user.project}. Fetching contacts...`);
   
+  try {
+    const mgmtContacts = await getManagementContacts(user.project);
+    
+    if (mgmtContacts.length === 0) {
+      console.warn(`⚠️ No supervisors/admins found for project: ${user.project}. WhatsApp alert skipped.`);
+    } else {
+      console.log(`📨 Sending shift-start alerts to ${mgmtContacts.length} contact(s)...`);
+      for (const phone of mgmtContacts) {
+        await sendWhatsAppAlert(
+          phone,
+          `🟢 SHIFT START: Agent ${user.name} (${user.employeeId}) has clocked in for project ${user.project}.`
+        );
+      }
+      console.log(`✅ All shift-start alerts dispatched.`);
+    }
+  } catch (waErr) {
+    // WhatsApp failure should NEVER crash the shift creation
+    console.error(`❌ WA alert block failed (non-critical):`, waErr.message);
+  }
+
   return { shiftId, resumed: false };
 });
 
@@ -453,6 +499,7 @@ exports.endShiftLogout = onCall(async (request) => {
   if (userData?.activeShiftId) {
     const shiftRef = db.doc(`shift_sessions/${userData.activeShiftId}`);
     const shiftSnap = await shiftRef.get();
+    
     if (shiftSnap.exists) {
       const shiftData = shiftSnap.data();
       const settings = await getSettings(userData.project);
@@ -474,10 +521,10 @@ exports.endShiftLogout = onCall(async (request) => {
   }
 
   await userRef.update({
-    activeShiftId: FieldValue.delete(),
+    activeShiftId: FieldValue.delete(), 
     activeBreakId: FieldValue.delete(),
-    workMode: FieldValue.delete(),
-    workModeDate: FieldValue.delete(),
+    workMode: FieldValue.delete(), 
+    workModeDate: FieldValue.delete(), 
     status: "OFFLINE",
   });
   
@@ -514,7 +561,7 @@ exports.supervisorForceEndShift = onCall(async (request) => {
       await db.collection("shift_reports").add({
         ...shiftData, 
         shiftEnd: FieldValue.serverTimestamp(),
-        totalDurationMs: elapsedMs,
+        totalDurationMs: elapsedMs, 
         closedBy: "SUPERVISOR_FORCE_LOGOUT", 
         closedByUid: callerUid
       });
@@ -530,14 +577,13 @@ exports.supervisorForceEndShift = onCall(async (request) => {
   }
 
   await userRef.update({
-    activeShiftId: FieldValue.delete(),
+    activeShiftId: FieldValue.delete(), 
     activeBreakId: FieldValue.delete(),
-    workMode: FieldValue.delete(),
-    workModeDate: FieldValue.delete(),
+    workMode: FieldValue.delete(), 
+    workModeDate: FieldValue.delete(), 
     status: "OFFLINE"
   });
 
-  // Heal the queue if this person was taking up a spot!
   await processQueue(proj);
   return { ok: true, message: "Agent shift forcefully closed." };
 });
@@ -573,7 +619,9 @@ exports.requestBreakNow = onCall(async (request) => {
   const effectiveUid = targetUid || uid;
 
   const user = await getUserDoc(effectiveUid);
-  if (!user.activeShiftId) throw new HttpsError("failed-precondition", "Shift inactive.");
+  if (!user.activeShiftId) {
+    throw new HttpsError("failed-precondition", "Shift inactive.");
+  }
 
   const shiftSnap = await db.doc(`shift_sessions/${user.activeShiftId}`).get();
   const shift = { id: shiftSnap.id, ...shiftSnap.data() };
@@ -637,17 +685,19 @@ exports.requestBreakNow = onCall(async (request) => {
     employeeId: user.employeeId, 
     agentName: user.name,
     project: user.project || "GENERAL", 
-    shiftId: shift.id,
+    shiftId: shift.id, 
     breakCategory: category, 
-    requestedDurationMin: minutesToUse,
+    requestedDurationMin: minutesToUse, 
     mode: "NOW", 
     requestedAt: now, 
     scheduledFor: null,
     notifiedReady: false, 
-    readyToStart: false,
+    readyToStart: false, 
     breakEndedAt: null, 
     actualMinutesUsed: null, 
-    exceeded: false,
+    exceeded: false, 
+    warningSent: false, 
+    exceededAlertSent: false
   };
 
   if (overlapCount >= settings.maxConcurrentBreaks) {
@@ -655,49 +705,45 @@ exports.requestBreakNow = onCall(async (request) => {
       const sSnap = await tx.get(shiftRef);
       tx.set(breakRef, {
         ...base, 
-        status: "AWAITING_SLOT",
-        suggestedTime: earliestEnd ? Timestamp.fromMillis(earliestEnd) : null,
+        status: "AWAITING_SLOT", 
+        suggestedTime: earliestEnd ? Timestamp.fromMillis(earliestEnd) : null, 
         breakStartedAt: null, 
         expectedEndAt: null,
       });
-      tx.set(shiftRef, { 
-        breakBudget: bumpBudget(sSnap.data().breakBudget, category, minutesToUse) 
-      }, { merge: true });
-      tx.set(userRef, { 
-        status: "IN_QUEUE", 
-        activeBreakId: breakRef.id 
-      }, { merge: true });
+      tx.set(shiftRef, { breakBudget: bumpBudget(sSnap.data().breakBudget, category, minutesToUse) }, { merge: true });
+      tx.set(userRef, { status: "IN_QUEUE", activeBreakId: breakRef.id }, { merge: true });
     });
     return { status: "AWAITING_SLOT", breakId: breakRef.id, suggestedTime: earliestEnd };
   } else {
-    // Immediate availability => We still put them in NOTIFIED_TO_START to maintain the 3-minute prompt UX.
     await db.runTransaction(async (tx) => {
       const sSnap = await tx.get(shiftRef);
       tx.set(breakRef, {
         ...base, 
         status: "NOTIFIED_TO_START", 
-        notifiedAt: now,
+        notifiedAt: now, 
         suggestedTime: null,
       });
-      tx.set(shiftRef, { 
-        breakBudget: bumpBudget(sSnap.data().breakBudget, category, minutesToUse) 
-      }, { merge: true });
-      tx.set(userRef, { 
-        status: "NOTIFIED_TO_START", 
-        activeBreakId: breakRef.id 
-      }, { merge: true });
+      tx.set(shiftRef, { breakBudget: bumpBudget(sSnap.data().breakBudget, category, minutesToUse) }, { merge: true });
+      tx.set(userRef, { status: "NOTIFIED_TO_START", activeBreakId: breakRef.id }, { merge: true });
     });
+    
+    // ⚡ WHATSAPP ALERT: Break is immediately ready
+    if (user.phone) {
+      sendWhatsAppAlert(user.phone, `🔔 BREAK READY: Hello ${user.name}, your ${category} break slot is ready! Please accept within 3 mins on your console.`);
+    }
+
     return { status: "NOTIFIED_TO_START", breakId: breakRef.id };
   }
 });
 
-// ⚡ LATER WITH CLASH RESOLVER
 exports.requestBreakLater = onCall(async (request) => {
   const uid = assertAuth(request);
   const { category, minutesNow, scheduledFor } = request.data || {};
   const user = await getUserDoc(uid);
   
-  if (!user.activeShiftId) throw new HttpsError("failed-precondition", "Shift inactive.");
+  if (!user.activeShiftId) {
+    throw new HttpsError("failed-precondition", "Shift inactive.");
+  }
 
   const shiftSnap = await db.doc(`shift_sessions/${user.activeShiftId}`).get();
   const shift = { id: shiftSnap.id, ...shiftSnap.data() };
@@ -716,8 +762,8 @@ exports.requestBreakLater = onCall(async (request) => {
   if (schedMs <= Date.now()) throw new HttpsError("invalid-argument", "Must schedule in the future.");
 
   const budget = shift.breakBudget;
-  let minutesToUse = category === "MEAL"
-    ? budget.mealTotalMin
+  let minutesToUse = category === "MEAL" 
+    ? budget.mealTotalMin 
     : Math.min(minutesNow || 15, budget.shortTotalMin - budget.shortUsedMin);
 
   const intervalStart = schedMs;
@@ -728,8 +774,8 @@ exports.requestBreakLater = onCall(async (request) => {
     .where("status", "in", ["ON_BREAK", "NOTIFIED_TO_START", "APPROVED_SCHEDULED"])
     .get();
 
-  let overlapCount = 0;
-  let earliestEnd = null;
+  let overlapCount = 0; 
+  let earliestEnd = null; 
   const nowMs = Date.now();
 
   activeAndScheduled.docs.forEach(d => {
@@ -762,13 +808,15 @@ exports.requestBreakLater = onCall(async (request) => {
       requestedDurationMin: minutesToUse,
       mode: "LATER", 
       status: "APPROVED_SCHEDULED",
-      requestedAt: Timestamp.now(),
+      requestedAt: Timestamp.now(), 
       scheduledFor: Timestamp.fromMillis(intervalStart),
       expectedEndAt: Timestamp.fromMillis(intervalEnd),
       breakStartedAt: null, 
-      breakEndedAt: null,
+      breakEndedAt: null, 
       actualMinutesUsed: null, 
       exceeded: false,
+      warningSent: false, 
+      exceededAlertSent: false
     });
     tx.set(shiftRef, { breakBudget: bumpBudget(sSnap.data().breakBudget, category, minutesToUse) }, { merge: true });
     tx.set(db.doc(`users/${uid}`), { status: "IN_QUEUE", activeBreakId: breakRef.id }, { merge: true });
@@ -778,10 +826,11 @@ exports.requestBreakLater = onCall(async (request) => {
 });
 
 exports.goingForBreak = onCall(async (request) => {
-  // Keeping this for backwards compatibility, but acceptBreakStart handles prompts now.
   const uid = assertAuth(request);
   const user = await getUserDoc(uid);
-  if (!user.activeBreakId) throw new HttpsError("failed-precondition", "No pending session.");
+  if (!user.activeBreakId) {
+    throw new HttpsError("failed-precondition", "No pending session.");
+  }
 
   const breakRef = db.doc(`break_sessions/${user.activeBreakId}`);
   const settings = await getSettings(user.project);
@@ -796,6 +845,7 @@ exports.goingForBreak = onCall(async (request) => {
     if (!bSnap.exists || bSnap.data().status !== "APPROVED_SCHEDULED") {
       throw new HttpsError("failed-precondition", "Unstartable state.");
     }
+    
     const b = bSnap.data();
     const now = Timestamp.now();
     
@@ -808,8 +858,11 @@ exports.goingForBreak = onCall(async (request) => {
       const oc = d.data();
       const e = oc.expectedEndAt ? oc.expectedEndAt.toMillis() : (oc.scheduledFor?.toMillis() + (oc.requestedDurationMin * 60000));
       if (e < now.toMillis()) return;
+      
       const s = oc.status === "APPROVED_SCHEDULED" ? oc.scheduledFor.toMillis() : (oc.breakStartedAt?.toMillis() || now.toMillis());
-      if (s < intervalEnd && e > intervalStart) overlapCount++;
+      if (s < intervalEnd && e > intervalStart) {
+        overlapCount++;
+      }
     });
 
     if (overlapCount < settings.maxConcurrentBreaks) {
@@ -829,7 +882,7 @@ exports.goingForBreak = onCall(async (request) => {
 });
 
 // ============================================================================
-// CRON JOBS
+// CRON JOBS (WHATSAPP ALERTS & AUTOMATION ENGINE)
 // ============================================================================
 
 // ⚡ CRON 1: Auto-Promotes Scheduled Breaks when their time arrives!
@@ -843,22 +896,32 @@ exports.autoStartScheduledBreaks = onSchedule("every 1 minutes", async () => {
   if (snap.empty) return;
 
   const batch = db.batch();
-  snap.forEach(docSnap => {
+  for (let docSnap of snap.docs) {
     const b = docSnap.data();
-    batch.update(docSnap.ref, {
-      status: "NOTIFIED_TO_START",
-      notifiedAt: now
+    
+    batch.update(docSnap.ref, { 
+      status: "NOTIFIED_TO_START", 
+      notifiedAt: now 
     });
-    batch.update(db.doc(`users/${b.uid}`), {
-      status: "NOTIFIED_TO_START"
+    
+    batch.update(db.doc(`users/${b.uid}`), { 
+      status: "NOTIFIED_TO_START" 
     });
-  });
+
+    // ⚡ WHATSAPP ALERT: Notify agent that scheduled break is ready
+    const uSnap = await db.doc(`users/${b.uid}`).get();
+    if (uSnap.exists && uSnap.data().phone) {
+      await sendWhatsAppAlert(
+        uSnap.data().phone, 
+        `🔔 SCHEDULE READY: Hello ${b.agentName}, your scheduled ${b.breakCategory} break is ready! Please accept within 3 mins on your console.`
+      );
+    }
+  }
   await batch.commit();
 });
 
 // ⚡ CRON 2: 3-Minute Missed SLA Reaper!
 exports.autoReleaseMissedBreaks = onSchedule("every 1 minutes", async () => {
-  // If they were notified more than 3 minutes ago
   const limitDate = Timestamp.fromMillis(Date.now() - (3 * 60000)); 
   
   const snap = await db.collection("break_sessions")
@@ -871,7 +934,6 @@ exports.autoReleaseMissedBreaks = onSchedule("every 1 minutes", async () => {
   for (let docSnap of snap.docs) {
     const b = docSnap.data();
     
-    // Reverse the shift budget and mark cancelled
     await db.runTransaction(async (tx) => {
       const shiftRef = db.doc(`shift_sessions/${b.shiftId}`);
       const sSnap = await tx.get(shiftRef);
@@ -880,19 +942,92 @@ exports.autoReleaseMissedBreaks = onSchedule("every 1 minutes", async () => {
           breakBudget: bumpBudget(sSnap.data().breakBudget, b.breakCategory, -b.requestedDurationMin) 
         }, { merge: true });
       }
+      
       tx.set(docSnap.ref, { 
         status: "CANCELLED", 
         cancelReason: "MISSED_SLA" 
       }, { merge: true });
+      
       tx.set(db.doc(`users/${b.uid}`), { 
         status: "AVAILABLE", 
         activeBreakId: FieldValue.delete() 
       }, { merge: true });
     });
     
-    // Heal the queue for the next waiting person
+    // ⚡ Heal the queue for the next waiting person
     await processQueue(b.project || "GENERAL"); 
   }
+});
+
+// ⚡ CRON 3: Meal Break 5-Minute Warning! (WhatsApp Alert)
+exports.autoMealBreakWarning = onSchedule("every 1 minutes", async () => {
+  const nowMs = Date.now();
+  const targetMs = nowMs + (5 * 60000);
+
+  const snap = await db.collection("break_sessions")
+    .where("status", "==", "ON_BREAK")
+    .where("breakCategory", "==", "MEAL")
+    .where("warningSent", "in", [false, null])
+    .get();
+
+  if (snap.empty) return;
+
+  const batch = db.batch();
+  for (let docSnap of snap.docs) {
+    const b = docSnap.data();
+    const endMs = b.expectedEndAt?.toMillis() || 0;
+    
+    if (endMs > nowMs && endMs <= targetMs + 30000) { 
+       batch.update(docSnap.ref, { warningSent: true });
+       
+       const uSnap = await db.doc(`users/${b.uid}`).get();
+       if (uSnap.exists && uSnap.data().phone) {
+         await sendWhatsAppAlert(
+           uSnap.data().phone, 
+           `⏳ MEAL WARNING: Hello ${b.agentName}, your MEAL break ends in 5 minutes! Please prepare to resume your shift.`
+         );
+       }
+    }
+  }
+  await batch.commit();
+});
+
+// ⚡ CRON 4: Break Exceeded Hooter (To Sups & Admins)!
+exports.autoBreakExceededAlert = onSchedule("every 1 minutes", async () => {
+  const now = Timestamp.now();
+  
+  const snap = await db.collection("break_sessions")
+    .where("status", "==", "ON_BREAK")
+    .where("expectedEndAt", "<=", now)
+    .get();
+
+  if (snap.empty) return;
+
+  const batch = db.batch();
+  for (let docSnap of snap.docs) {
+    const b = docSnap.data();
+    
+    if (b.exceededAlertSent) continue;
+
+    batch.update(docSnap.ref, { 
+      exceeded: true, 
+      exceededAlertSent: true 
+    });
+    
+    batch.update(db.doc(`users/${b.uid}`), { 
+      status: "BREAK_EXCEEDED" 
+    });
+
+    // ⚡ WHATSAPP ALERT: Send to Project Supervisors and Admins
+    const contacts = await getManagementContacts(b.project);
+    for (let phone of contacts) {
+       await sendWhatsAppAlert(
+         phone, 
+         `🚨 OVERRUN ALERT: Agent ${b.agentName} (${b.employeeId}) has exceeded their allotted ${b.breakCategory} break time! Please check the dashboard.`
+       );
+    }
+  }
+  await batch.commit();
 });
 
 exports.autoCloseStaleShifts = onSchedule("every 1 hours", async () => {
@@ -931,6 +1066,7 @@ exports.autoCloseStaleShifts = onSchedule("every 1 hours", async () => {
 exports.endBreak = onCall(async (request) => {
   const uid = assertAuth(request);
   const user = await getUserDoc(uid);
+  
   if (!user.activeBreakId) {
     throw new HttpsError("failed-precondition", "No active break.");
   }
@@ -976,14 +1112,18 @@ exports.cancelScheduledBreak = onCall(async (request) => {
 
     const refundMin = Number(b.requestedDurationMin) || 0;
     if (shiftSnap.exists && refundMin > 0) {
-      tx.set(shiftRef, { breakBudget: bumpBudget(shiftSnap.data().breakBudget, b.breakCategory, -refundMin) }, { merge: true });
+      tx.set(shiftRef, { 
+        breakBudget: bumpBudget(shiftSnap.data().breakBudget, b.breakCategory, -refundMin) 
+      }, { merge: true });
     }
     
     tx.set(breakRef, { status: "CANCELLED" }, { merge: true });
-    tx.set(db.doc(`users/${uid}`), { status: "AVAILABLE", activeBreakId: FieldValue.delete() }, { merge: true });
+    tx.set(db.doc(`users/${uid}`), { 
+      status: "AVAILABLE", 
+      activeBreakId: FieldValue.delete() 
+    }, { merge: true });
   });
 
-  // ⚡ AUTO-PROMOTE NEXT IN QUEUE
   await processQueue(proj);
   return { ok: true };
 });

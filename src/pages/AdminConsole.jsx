@@ -464,6 +464,11 @@ function AdminUserRow({ user, livePresence, onEdit, isSuperAdmin }) {
     if (livePresence.workMode) effWorkMode = livePresence.workMode; 
   }
 
+  // ⚡ Explicitly pull NOTIFIED_TO_START from user document if prompt is active
+  if (user.status === "NOTIFIED_TO_START") {
+    projectedStatus = "NOTIFIED_TO_START";
+  }
+
   const isActiveDuty = user.role === "AGENT" ? hasShift : (livePresence && livePresence.status !== "OFFLINE");
   const isTargetSuperAdmin = user.role === "SUPER_ADMIN" || (user.role === "ADMIN" && ["ROOT", "ALL", "GENERAL"].includes((user.project || "GENERAL").toUpperCase()));
   const canEdit = isSuperAdmin || !isTargetSuperAdmin;
@@ -535,12 +540,14 @@ function AdminUserRow({ user, livePresence, onEdit, isSuperAdmin }) {
   );
 }
 
+// ⚡ SLA Prompt Added to Admin View
 function UserStatusBadge({ status }) {
   const map = { 
     ONLINE: { text: "Online", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" }, 
     AVAILABLE: { text: "Available", cls: "bg-emerald-50 text-emerald-700 border-emerald-200 font-bold" }, 
     PRE_SHIFT: { text: "Pre-Shift", cls: "bg-blue-50 text-blue-600 border-blue-200 font-bold" }, 
     IN_QUEUE: { text: "In Queue", cls: "bg-indigo-50 text-indigo-700 border-indigo-200" }, 
+    NOTIFIED_TO_START: { text: "Ready (3m)", cls: "bg-fuchsia-50 text-fuchsia-700 border-fuchsia-200 font-bold animate-pulse" },
     ON_BREAK: { text: "On Break", cls: "bg-amber-50 text-amber-700 border-amber-200 font-bold animate-pulse" }, 
     BREAK_EXCEEDED: { text: "Over Limit", cls: "bg-rose-50 text-rose-700 border-rose-200 font-black animate-ping" }, 
     OFFLINE: { text: "Offline", cls: "bg-slate-100 text-slate-400 border-slate-200 font-medium" } 
@@ -622,8 +629,8 @@ function AdminProvisionModal({ projectsList, onClose, isSuperAdmin, myProject })
               </div>
             </div>
             <div>
-              <label className="block text-[10px] font-bold text-slate-400 mb-1 font-mono">WhatsApp Routing</label>
-              <input type="text" required value={phone} onChange={e => setPhone(e.target.value)} placeholder="+91..." className="input-glass w-full rounded-2xl p-3.5 text-xs font-bold outline-none font-sans" />
+              <label className="block text-[10px] font-bold text-slate-400 mb-1 font-mono">WhatsApp Routing (e.g. 919876543210)</label>
+              <input type="text" required value={phone} onChange={e => setPhone(e.target.value)} placeholder="91..." className="input-glass w-full rounded-2xl p-3.5 text-xs font-bold outline-none font-sans" />
             </div>
             <button type="submit" disabled={busy} className="btn-glass w-full font-black py-4 rounded-2xl text-xs uppercase cursor-pointer mt-2">
               {busy ? "Creating..." : "Create Account"}

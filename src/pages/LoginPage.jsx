@@ -20,7 +20,7 @@ export default function LoginPage() {
       const email = `${empId.trim().toLowerCase()}@breakapp.internal`;
       await signInWithEmailAndPassword(auth, email, pass);
     } catch (error) {
-      setErr(error.message.includes("auth/") ? "Invalid Capgemini ID or Passphrase" : error.message);
+      setErr(error.message.includes("auth/") ? "Invalid ID or Passphrase" : error.message);
       setLoading(false);
     }
   };
@@ -36,7 +36,7 @@ export default function LoginPage() {
         </div>
         <div className="glass flex items-center gap-1.5 text-xs font-bold text-emerald-700 px-3.5 py-1.5 rounded-full">
           <ShieldCheck size={14} className="text-emerald-600" />
-          <span className="hidden sm:inline">Capgemini Enterprise Gate</span>
+          <span className="hidden sm:inline"> Break management Gateway</span>
           <span className="sm:hidden">Enterprise Gate</span>
         </div>
       </header>
@@ -48,8 +48,8 @@ export default function LoginPage() {
             <div className="inline-flex p-3.5 rounded-2xl text-indigo-600 mb-1 bg-white/60 border border-white/70 shadow-inner glow-pulse">
               <Sparkles size={24} />
             </div>
-            <h2 className="text-2xl sm:text-[26px] font-black text-slate-900 tracking-tight">Access Control Center</h2>
-            <p className="text-xs text-slate-500 font-medium">Authenticate with your assigned pseudonymous ID</p>
+            <h2 className="text-2xl sm:text-[26px] font-black text-slate-900 tracking-tight">Break IQ</h2>
+            <p className="text-xs text-slate-500 font-medium">Smart Break Management System</p>
           </div>
 
           <form onSubmit={handleLogin} className="space-y-5">

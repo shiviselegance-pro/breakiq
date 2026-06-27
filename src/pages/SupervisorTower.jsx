@@ -44,7 +44,6 @@ export default function SupervisorTower() {
     window.location.replace("/");
   };
 
-  // ⚡ OUTAGE LIFT FIXED: Bright green when paused!
   const handleToggleLockdown = async () => {
     const action = isFloorFrozen ? "Resume All Breaks (Lift Outage)" : "Pause All Breaks";
     const reason = isFloorFrozen ? null : prompt("Reason for pausing breaks:", "High Volume / Outage");
@@ -97,7 +96,6 @@ export default function SupervisorTower() {
     }
   };
 
-  // ⚡ FLUSH QUEUE FUNCTION RESTORED
   const handleFlushQueue = async () => {
     if (!confirm(`Purge all stuck breaks and reset stuck counters?`)) return;
     setFlushing(true);
@@ -112,7 +110,7 @@ export default function SupervisorTower() {
 
   const myProjectAgents = useMemo(() => agents.filter(a => (a.project || "GENERAL").toUpperCase() === myProject), [agents, myProject]);
   
-  // ⚡ GHOST COUNT BUG FIXED: Filters strictly active ON_BREAK sessions belonging to existing staff!
+  // ⚡ GHOST COUNT BUG FIXED
   const validAgentUids = useMemo(() => new Set(myProjectAgents.map(a => a.uid || a.id)), [myProjectAgents]);
   
   const activeProjectBreaks = useMemo(() => {
@@ -125,8 +123,6 @@ export default function SupervisorTower() {
 
   const agentsOnBreakCount = activeProjectBreaks.length;
   const exceededProjectBreaks = activeProjectBreaks.filter(b => b.exceeded).length;
-  
-  // Strict queue count based on actual agent states
   const agentsInQueueCount = myProjectAgents.filter(a => a.status === "IN_QUEUE" || a.status === "AWAITING_SLOT" || a.status === "NOTIFIED_TO_START").length;
 
   const processedRoster = useMemo(() => {
@@ -170,7 +166,6 @@ export default function SupervisorTower() {
           </div>
           <div className="flex flex-wrap items-center gap-2 font-mono w-full sm:w-auto justify-end">
             
-            {/* ⚡ GREEN BUTTON WHEN PAUSED */}
             <button onClick={handleToggleLockdown} disabled={togglingOutage} className={`flex flex-1 sm:flex-initial items-center justify-center gap-1.5 rounded-xl px-3 sm:px-4 py-2 text-[11px] sm:text-xs font-black uppercase cursor-pointer transition-all shadow-sm ${isFloorFrozen ? "bg-emerald-600 hover:bg-emerald-500 text-white animate-pulse" : "bg-rose-50 text-rose-600 border border-rose-200 hover:bg-rose-100"}`}>
               {togglingOutage ? <Loader2 size={13} className="animate-spin" /> : <AlertTriangle size={13} />} 
               <span>{isFloorFrozen ? "▶ Resume Breaks (Lift)" : "⏸ Pause Breaks"}</span>
@@ -203,7 +198,6 @@ export default function SupervisorTower() {
 
       <main className="relative z-10 mx-auto max-w-7xl px-4 sm:px-6 mt-6 space-y-6 animate-rise font-sans">
         
-        {/* ⚡ RESPONSIVE METRIC CARDS */}
         <div className="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-4 font-mono">
           <div className="glass rounded-[24px] sm:rounded-[28px] p-4 sm:p-5 text-indigo-600">
             <span className="text-[9px] sm:text-[10px] text-slate-400 uppercase font-bold block mb-1">Agents on Break</span>
@@ -214,7 +208,6 @@ export default function SupervisorTower() {
             <div className="text-2xl sm:text-3xl font-black text-slate-900">{myProjectAgents.length}</div>
           </div>
           
-          {/* ⚡ PERMANENT VISIBLE FLUSH BUTTON INSIDE CARD */}
           <div className="glass rounded-[24px] sm:rounded-[28px] p-4 sm:p-5 text-slate-700 flex flex-col justify-between">
             <div>
               <span className="text-[9px] sm:text-[10px] text-slate-400 uppercase font-bold block mb-1">Breaks in Queue</span>
@@ -250,7 +243,6 @@ export default function SupervisorTower() {
                 </div>
               </div>
 
-              {/* ⚡ MOBILE SCROLLABLE TABLE Container */}
               <div className="overflow-x-auto rounded-2xl border border-slate-200/60 font-sans w-full">
                 <table className="w-full text-left border-collapse min-w-[650px]">
                   <thead className="bg-slate-50/70 font-mono text-[10px] font-bold uppercase text-slate-500 border-b border-slate-200/60">
@@ -399,7 +391,7 @@ function SupervisoryLightRow({ agent, now, isRevoking, onForceEnd, onReject, isR
     }
   };
 
-  // ⚡ DYNAMIC DETAILED BREAK TEXT (Requirements #2 and #3)
+  // ⚡ DYNAMIC DETAILED BREAK TEXT
   let displayStatus = "Offline"; 
   let badgeColor = "bg-white/50 border-slate-200 text-slate-400"; 
   let brkStr = "—";
@@ -427,7 +419,14 @@ function SupervisoryLightRow({ agent, now, isRevoking, onForceEnd, onReject, isR
       displayStatus = "In Queue"; 
       badgeColor = "bg-indigo-50/90 border-indigo-200 text-indigo-700 font-bold";
       const reqTime = b.requestedAt ? new Date(toMillis(b.requestedAt)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-      brkStr = `Queued ${b.breakCategory} ${reqTime ? '('+reqTime+')' : ''}`;
+      
+      // Check if there is a suggested time for immediate queue
+      if (b.suggestedTime) {
+         const sugTimeStr = new Date(toMillis(b.suggestedTime)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+         brkStr = `Queued ${b.breakCategory} (est. ${sugTimeStr})`;
+      } else {
+         brkStr = `Queued ${b.breakCategory} ${reqTime ? '('+reqTime+')' : ''}`;
+      }
     } else {
       displayStatus = "In Queue"; 
       badgeColor = "bg-indigo-50/90 border-indigo-200 text-indigo-700 font-bold";
@@ -492,7 +491,6 @@ function SupervisoryLightRow({ agent, now, isRevoking, onForceEnd, onReject, isR
       </td>
     </tr>
 
-    {/* ⚡ MANUAL LOGOUT WARNING MODAL */}
     {showForceLogoutModal && (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4 animate-in fade-in font-sans">
         <div className="glass w-full max-w-md rounded-[32px] p-8 text-center space-y-6 animate-rise shadow-2xl bg-white/95">
