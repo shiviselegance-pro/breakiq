@@ -1,62 +1,88 @@
 import React, { useState } from "react";
-import { doc, setDoc } from "firebase/firestore";
-import { db } from "./firebase";
+import { signOut } from "firebase/auth";
+import { auth } from "./firebase";
 import { AuthProvider, useAuth } from "./context/AuthContext";
-import LoginPage from "./pages/LoginPage";
-import AgentConsole from "./pages/AgentConsole";
+import LoginPage       from "./pages/LoginPage";
+import AgentConsole    from "./pages/AgentConsole";
 import SupervisorTower from "./pages/SupervisorTower";
-import AdminConsole from "./pages/AdminConsole";
-import { Loader2, Home, Building2 } from "lucide-react";
+import AdminConsole    from "./pages/AdminConsole";
+import { Loader2, RefreshCw } from "lucide-react";
 
-function PerimeterGate({ profile, todayStr }) {
-  const [stamping, setStamping] = useState(false);
-  const handleStampPerimeter = async (mode) => {
-    setStamping(true);
-    try {
-      const targetUid = profile.uid || profile.id;
-      await setDoc(doc(db, "users", targetUid), { workMode: mode, workModeDate: todayStr }, { merge: true });
-      await setDoc(doc(db, "presence", targetUid), { workMode: mode, status: "ONLINE", lastActive: Date.now(), role: profile.role, name: profile.name, project: profile.project || "GENERAL" }, { merge: true });
-    } catch (err) { alert("Perimeter stamp failed: " + err.message); setStamping(false); }
-  };
-
+// ── Loading screen ─────────────────────────────────────────────────────────
+function LoadingScreen({ message = "Verifying IAM Clearance...", onForceWipe }) {
   return (
-    <div className="min-h-screen bg-[#f8fafc] flex items-center justify-center p-6 font-sans selection:bg-indigo-500 selection:text-white relative overflow-hidden">
-      <div className="mesh-bg"><span className="mesh-orb" /></div>
-      <div className="glass relative z-10 w-full max-w-md rounded-[32px] p-8 text-center space-y-6 animate-in zoom-in-95 duration-300">
-        <div className="inline-flex p-4 bg-amber-50 rounded-2xl text-amber-600 border border-amber-200/80 shadow-inner animate-bounce"><Home size={28} /></div>
-        <div className="space-y-2"><span className="text-[10px] font-mono font-bold uppercase tracking-widest px-3 py-1 bg-indigo-50 text-indigo-600 rounded-full border border-indigo-200">Step 2 · Security Perimeter</span><h2 className="text-2xl font-black text-slate-900 tracking-tight">Operational Declaration</h2><p className="text-xs text-slate-500 font-medium leading-relaxed max-w-xs mx-auto">Welcome <strong className="text-slate-700">{profile.name}</strong>. Please select your operational base for today ({todayStr}):</p></div>
-        <div className="grid grid-cols-2 gap-3 pt-2 font-mono">
-          <button onClick={() => handleStampPerimeter("WFH")} disabled={stamping} className="p-5 rounded-2xl border border-indigo-200/80 bg-indigo-50/50 hover:bg-indigo-50 text-indigo-700 font-black transition-all flex flex-col items-center gap-2.5 cursor-pointer shadow-sm group active:scale-95 disabled:opacity-50"><Home size={22} className="group-hover:scale-110 transition-transform text-indigo-600" /><span>🏠 WFH (Home)</span></button>
-          <button onClick={() => handleStampPerimeter("WFO")} disabled={stamping} className="p-5 rounded-2xl border border-slate-200/80 bg-white/80 hover:bg-white text-slate-800 font-black transition-all flex flex-col items-center gap-2.5 cursor-pointer shadow-sm group active:scale-95 disabled:opacity-50"><Building2 size={22} className="group-hover:scale-110 transition-transform text-slate-600" /><span>🏢 WFO (Office)</span></button>
-        </div>
-        {stamping && <p className="text-xs font-mono font-bold text-indigo-600 animate-pulse flex items-center justify-center gap-1.5"><Loader2 size={14} className="animate-spin" /> Stamping operational perimeter...</p>}
-      </div>
+    <div className="min-h-screen bg-[#f8fafc] flex flex-col items-center justify-center gap-4 font-sans selection:bg-indigo-500">
+      <Loader2 className="animate-spin text-indigo-600" size={36} />
+      <p className="text-xs font-mono font-bold text-slate-400">{message}</p>
+      {onForceWipe && (
+        <button
+          onClick={onForceWipe}
+          className="mt-6 px-4 py-2 bg-rose-50 border border-rose-200 text-rose-600 rounded-xl text-[11px] font-mono font-bold hover:bg-rose-100 transition-all cursor-pointer flex items-center gap-1.5 shadow-sm active:scale-95"
+        >
+          <RefreshCw size={13} /> Force Clear Stuck Session
+        </button>
+      )}
     </div>
   );
 }
 
+// ── Router ─────────────────────────────────────────────────────────────────
 function Router() {
-  const { currentUser, profile, loading } = useAuth();
-  
-  // ⚡ CRASH FIX: Waits until Profile payload strictly arrives from Firestore before routing!
-  if (loading || (currentUser && !profile)) {
-    return <div className="min-h-screen bg-[#f8fafc] flex items-center justify-center"><Loader2 className="animate-spin text-indigo-600" size={32} /></div>;
+  const { currentUser, profile, authLoading, profileLoading } = useAuth();
+  const [purging, setPurging] = useState(false);
+
+  const handleEmergencyWipe = async () => {
+    setPurging(true);
+    try { await signOut(auth); } catch (_) {}
+    localStorage.clear();
+    sessionStorage.clear();
+    window.location.replace("/");
+  };
+
+  // 1. Hard reset in progress
+  if (purging) return <LoadingScreen message="Clearing session..." />;
+
+  // 2. Firebase Auth SDK still initialising
+  if (authLoading) {
+    return (
+      <LoadingScreen
+        message="Verifying Capgemini IAM Clearance..."
+        onForceWipe={handleEmergencyWipe}
+      />
+    );
   }
+
+  // 3. Auth resolved — no user logged in
   if (!currentUser) return <LoginPage />;
 
-  const todayStr = new Date().toDateString();
-  const isOperator = profile.role === "AGENT" || profile.role === "SUPERVISOR";
-  const needsPerimeterStamp = isOperator && (!profile.workMode || profile.workModeDate !== todayStr);
+  // 4. User logged in, Firestore profile still loading
+  if (profileLoading) {
+    return (
+      <LoadingScreen
+        message="Hydrating Workforce Matrix..."
+        onForceWipe={handleEmergencyWipe}
+      />
+    );
+  }
 
-  if (needsPerimeterStamp) return <PerimeterGate profile={profile} todayStr={todayStr} />;
+  // 5. Profile fetch done but doc missing — orphaned auth account
+  if (!profile) return <LoginPage />;
 
+  // 6. Happy path — route by role
   switch (profile.role) {
     case "SUPER_ADMIN":
-    case "ADMIN": return <AdminConsole />;
+    case "ADMIN":      return <AdminConsole />;
     case "SUPERVISOR": return <SupervisorTower />;
-    case "AGENT": return <AgentConsole />;
-    default: return <LoginPage />;
+    case "AGENT":      return <AgentConsole />;
+    default:           return <LoginPage />;
   }
 }
 
-export default function App() { return <AuthProvider><Router /></AuthProvider>; }
+// ── App root ───────────────────────────────────────────────────────────────
+export default function App() {
+  return (
+    <AuthProvider>
+      <Router />
+    </AuthProvider>
+  );
+}

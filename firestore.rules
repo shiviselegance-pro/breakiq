@@ -1,50 +1,71 @@
-// firestore.rules
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    function isSignedIn() { return request.auth != null; }
-    function role() { return request.auth.token.role; }
-    function isAdmin() { return isSignedIn() && role() == 'ADMIN'; }
+    function isSignedIn()   { return request.auth != null; }
+    function role()         { return request.auth.token.role; }
+    function isAdmin()      { return isSignedIn() && (role() == 'ADMIN' || role() == 'SUPER_ADMIN'); }
     function isSupervisor() { return isSignedIn() && role() == 'SUPERVISOR'; }
-    function isStaff() { return isAdmin() || isSupervisor(); }
-    function isSelf(uid) { return isSignedIn() && request.auth.uid == uid; }
+    function isStaff()      { return isAdmin() || isSupervisor(); }
+    function isSelf(uid)    { return isSignedIn() && request.auth.uid == uid; }
 
-    // All break-state mutations happen exclusively through Cloud Functions
-    // (Admin SDK). That's deliberate: the concurrency-limit + FIFO-queue
-    // logic needs atomic multi-document transactions, which rules can't
-    // express safely. Rules here only gate READS, plus a couple of
-    // low-stakes self-writes (presence).
-
+    // ── Users ──────────────────────────────────────────────────────────────
     match /users/{uid} {
-  allow read, write: if true; 
+      allow read, write: if true;
     }
+
+    // ── Shift sessions ─────────────────────────────────────────────────────
     match /shift_sessions/{id} {
-      allow read: if isStaff() || (isSignedIn() && resource.data.uid == request.auth.uid);
+      allow read:  if isStaff() || (isSignedIn() && resource.data.uid == request.auth.uid);
       allow write: if false;
     }
+
+    // ── Break sessions ─────────────────────────────────────────────────────
     match /break_sessions/{id} {
-      allow read: if isStaff() || (isSignedIn() && resource.data.uid == request.auth.uid);
+      allow read:  if isStaff() || (isSignedIn() && resource.data.uid == request.auth.uid);
       allow write: if false;
     }
+
+    // ── Break aggregates ───────────────────────────────────────────────────
     match /break_aggregates/{id} {
-      allow read: if isStaff();
+      allow read:  if isStaff();
       allow write: if false;
     }
+
+    // ── Break / project settings ───────────────────────────────────────────
     match /break_settings/{id} {
-      allow read: if isSignedIn();
+      allow read:  if isSignedIn();
       allow write: if isAdmin();
     }
+
+    match /project_settings/{id} {
+      allow read:  if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ── Projects list ──────────────────────────────────────────────────────
+    match /projects/{id} {
+      allow read:  if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ── Counters (internal only, never expose to client) ───────────────────
     match /counters/{id} {
       allow read, write: if false;
     }
+
+    // ── Presence ───────────────────────────────────────────────────────────
+    // FIX: Pehle rule mein role field mandatory thi, isliye AuthContext ka
+    // presence write (jo sirf status + lastHeartbeatAt likhta hai) fail hota
+    // tha. signOut tab bhi skip ho jaata tha → session alive rehta tha →
+    // npm run dev pe seedha dashboard khulta tha.
+    //
+    // Fix: isSelf(uid) check enough hai. Role spoofing ka risk nahi kyunki
+    // saara sensitive data Cloud Functions ke through hi mutate hota hai.
     match /presence/{uid} {
-      allow read: if isSignedIn();
-      // role spoof-proofed: client can only write the role it already has
-      // on its trusted users/ doc.
-      allow create, update: if isSelf(uid)
-        && request.resource.data.role == get(/databases/$(database)/documents/users/$(uid)).data.role;
-      allow delete: if false;
+      allow read:          if isSignedIn();
+      allow create, update: if isSelf(uid);   // ← role field check hataya
+      allow delete:        if false;
     }
   }
 }

@@ -13,12 +13,13 @@ export function useAuth() {
 }
 
 export function AuthProvider({ children }) {
-  const [currentUser, setCurrentUser] = useState(null);
-  const [profile, setProfile] = useState(null);
-  const [authLoading, setAuthLoading] = useState(true);
+  const [currentUser, setCurrentUser]       = useState(null);
+  const [profile, setProfile]               = useState(null);
+  const [authLoading, setAuthLoading]       = useState(true);
   const [profileLoading, setProfileLoading] = useState(false);
-  const [error, setError] = useState(null);
+  const [error, setError]                   = useState(null);
 
+  // ── Auth state listener ────────────────────────────────────────────────
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (user) => {
       setCurrentUser(user);
@@ -27,34 +28,52 @@ export function AuthProvider({ children }) {
     return () => unsub();
   }, []);
 
+  // ── Firestore profile listener ─────────────────────────────────────────
   useEffect(() => {
     if (!currentUser) { setProfile(null); return; }
     setProfileLoading(true);
-    const ref = doc(db, "users", currentUser.uid);
-    const unsub = onSnapshot(ref, (snap) => {
-      setProfile(snap.exists() ? { uid: snap.id, ...snap.data() } : null);
-      setProfileLoading(false);
-    }, (err) => {
-      setError(err.message);
-      setProfileLoading(false);
-    });
+    const unsub = onSnapshot(
+      doc(db, "users", currentUser.uid),
+      (snap) => {
+        setProfile(snap.exists() ? { uid: snap.id, ...snap.data() } : null);
+        setProfileLoading(false);
+      },
+      (err) => { setError(err.message); setProfileLoading(false); }
+    );
     return () => unsub();
   }, [currentUser]);
 
+  // ── Helpers ────────────────────────────────────────────────────────────
+  // FIX: Presence writes mein role field bhi include karo taaki
+  // firestore.rules ka role-check pass ho sake (login + logout dono mein).
+  const writePresence = useCallback(async (uid, role, status) => {
+    try {
+      await setDoc(
+        doc(db, "presence", uid),
+        { uid, role, status, lastHeartbeatAt: serverTimestamp() },
+        { merge: true }
+      );
+    } catch (e) {
+      console.warn("Presence write err:", e);
+    }
+  }, []);
+
+  // ── Login ──────────────────────────────────────────────────────────────
   const login = useCallback(async (employeeId, password) => {
     setError(null);
     const email = `${employeeId.trim().toLowerCase()}@${ORG_DOMAIN}`;
-    const cred = await signInWithEmailAndPassword(auth, email, password);
+    const cred  = await signInWithEmailAndPassword(auth, email, password);
 
-    // Presence ONLINE initialization
-    try {
-      await setDoc(doc(db, "presence", cred.user.uid),
-        { uid: cred.user.uid, status: "ONLINE", lastHeartbeatAt: serverTimestamp() },
-        { merge: true }
-      );
-    } catch (e) { console.warn("Presence stamp err:", e); }
+    // Read role from Firestore before writing presence
+    // (custom claims may not be set; profile doc is the source of truth)
+    const userSnap = await import("firebase/firestore").then(({ getDoc }) =>
+      getDoc(doc(db, "users", cred.user.uid))
+    );
+    const userRole = userSnap.exists() ? userSnap.data().role : "AGENT";
 
-    // Execute shift start exclusively for floor agents
+    await writePresence(cred.user.uid, userRole, "ONLINE");
+
+    // Start shift — only relevant for floor agents
     try {
       await httpsCallable(functions, "startShift")();
     } catch (e) {
@@ -62,28 +81,52 @@ export function AuthProvider({ children }) {
         console.warn("Shift handshake anomaly:", e.code, e.message);
       }
     }
-    return cred.user;
-  }, []);
 
+    return cred.user;
+  }, [writePresence]);
+
+  // ── Logout ─────────────────────────────────────────────────────────────
+  // FIX 1: endShiftLogout sirf AGENT / SUPERVISOR ke liye fire hoga.
+  //         ADMIN / SUPER_ADMIN ke liye nahi — yahi root cause tha
+  //         logout ke baad AdminConsole pe redirect hone ka.
+  // FIX 2: presence write mein role field include ki — warna Firestore
+  //         rule fail karta tha aur signOut bhi execute nahi hota tha.
   const logout = useCallback(async () => {
     if (currentUser) {
-      try { await httpsCallable(functions, "endShiftLogout")(); } 
-      catch (e) { console.warn("Shift termination anomaly:", e); }
+      const role = profile?.role;
 
-      try {
-        await setDoc(doc(db, "presence", currentUser.uid),
-          { status: "OFFLINE", lastHeartbeatAt: serverTimestamp() },
-          { merge: true }
-        );
-      } catch (e) { console.warn("Presence offline dispatch err:", e); }
+      // End shift only for floor roles
+      if (role === "AGENT" || role === "SUPERVISOR") {
+        try {
+          await httpsCallable(functions, "endShiftLogout")();
+        } catch (e) {
+          console.warn("Shift termination anomaly:", e);
+        }
+      }
+
+      // Mark OFFLINE — role field zaroori hai Firestore rule ke liye
+      await writePresence(currentUser.uid, role, "OFFLINE");
     }
-    await signOut(auth);
-  }, [currentUser]);
 
+    await signOut(auth);
+  }, [currentUser, profile, writePresence]);
+
+  // ── Context value ──────────────────────────────────────────────────────
   const value = {
-    currentUser, profile, role: profile?.role ?? null,
-    loading: authLoading || profileLoading, error, login, logout,
+    currentUser,
+    profile,
+    role:           profile?.role ?? null,
+    loading:        authLoading || profileLoading,
+    authLoading,
+    profileLoading,
+    error,
+    login,
+    logout,
   };
 
-  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+  return (
+    <AuthContext.Provider value={value}>
+      {children}
+    </AuthContext.Provider>
+  );
 }

@@ -1,31 +1,26 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { collection, doc, onSnapshot, setDoc, deleteDoc, serverTimestamp } from "firebase/firestore";
 import { httpsCallable } from "firebase/functions";
-import { db, functions } from "../firebase";
+import { auth, db, functions } from "../firebase";
 import { useAuth } from "../context/AuthContext";
 import { useHeartbeat, useOnlineRoster } from "../hooks/usePresence";
+import { WorkModeToggle } from "./AgentConsole"; // ⚡ Importing the smooth toggle
 import { UserPlus, LogOut, Search, Edit, Trash2, X, Building2, FolderPlus, Folder, SlidersHorizontal, Lock } from "lucide-react";
 
-const DEFAULT_SETTINGS = { 
-  shiftDurationHours: 9, mealBreakMin: 40, shortBreakMin: 20, 
-  lockoutStartMin: 60, lockoutEndMin: 60, maxConcurrentBreaks: 2 
-};
+const DEFAULT_SETTINGS = { shiftDurationHours: 9, mealBreakMin: 40, shortBreakMin: 20, lockoutStartMin: 60, lockoutEndMin: 60, maxConcurrentBreaks: 2 };
 
 export default function AdminConsole() {
-  const { profile, logout } = useAuth();
+  const { profile } = useAuth();
   useHeartbeat(profile?.uid, profile?.name, profile?.role);
 
   const supervisorsOnline = useOnlineRoster("SUPERVISOR");
   const agentsOnline = useOnlineRoster("AGENT");
 
   const [users, setUsers] = useState([]);
-  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [projectsList, setProjectsList] = useState(["GENERAL", "BENTLEY", "FOOTLOCKER"]);
   const [activePresences, setActivePresences] = useState(new Map());
 
-  // ⚡ THE BRAND NEW TAB STATE
   const [activeTab, setActiveTab] = useState("DIRECTORY");
-
   const [searchQuery, setSearchQuery] = useState("");
   const [roleFilter, setRoleFilter] = useState("ALL");
   const [projectFilter, setProjectFilter] = useState("ALL");
@@ -35,39 +30,16 @@ export default function AdminConsole() {
   const myProject = (profile?.project || "GENERAL").trim().toUpperCase();
   const isSuperAdmin = profile?.role === "SUPER_ADMIN" || (profile?.role === "ADMIN" && ["ROOT", "ALL", "GENERAL"].includes(myProject));
 
-  useEffect(() => { 
-    const unsub = onSnapshot(collection(db, "users"), snap => setUsers(snap.docs.map(d => ({ id: d.id, ...d.data() })))); 
-    return () => unsub(); 
-  }, []);
-  
-  useEffect(() => { 
-    const unsub = onSnapshot(collection(db, "projects"), snap => { 
-      const pArr = snap.docs.map(d => d.id); 
-      if (!pArr.includes("GENERAL")) pArr.unshift("GENERAL"); 
-      setProjectsList(pArr); 
-    }); 
-    return () => unsub(); 
-  }, []);
-  
-  useEffect(() => { 
-    const unsub = onSnapshot(doc(db, "break_settings", "config"), snap => { 
-      if (snap.exists()) setSettings(snap.data()); 
-    }); 
-    return () => unsub(); 
-  }, []);
-  
-  useEffect(() => { 
-    const unsub = onSnapshot(collection(db, "presence"), snap => { 
-      const pMap = new Map(); 
-      snap.docs.forEach(d => { if (d.data()?.status === "ONLINE") pMap.set(d.id, d.data()); }); 
-      setActivePresences(pMap); 
-    }); 
-    return () => unsub(); 
-  }, []);
+  const handleSafeLogout = async () => {
+    try { await auth.signOut(); } catch(e) {}
+    setTimeout(() => { window.location.replace("/"); }, 400);
+  };
 
-  const visibleUsers = useMemo(() => 
-    isSuperAdmin ? users : users.filter(u => (u.project || "GENERAL").toUpperCase() === myProject), 
-  [users, isSuperAdmin, myProject]);
+  useEffect(() => { const unsub = onSnapshot(collection(db, "users"), snap => setUsers(snap.docs.map(d => ({ id: d.id, ...d.data() })))); return () => unsub(); }, []);
+  useEffect(() => { const unsub = onSnapshot(collection(db, "projects"), snap => { const pArr = snap.docs.map(d => d.id); if (!pArr.includes("GENERAL")) pArr.unshift("GENERAL"); setProjectsList(pArr); }); return () => unsub(); }, []);
+  useEffect(() => { const unsub = onSnapshot(collection(db, "presence"), snap => { const pMap = new Map(); snap.docs.forEach(d => { if (d.data()?.status === "ONLINE") pMap.set(d.id, d.data()); }); setActivePresences(pMap); }); return () => unsub(); }, []);
+
+  const visibleUsers = useMemo(() => isSuperAdmin ? users : users.filter(u => (u.project || "GENERAL").toUpperCase() === myProject), [users, isSuperAdmin, myProject]);
 
   const processedUsers = useMemo(() => {
     return visibleUsers
@@ -82,17 +54,14 @@ export default function AdminConsole() {
   }, [visibleUsers, searchQuery, roleFilter, projectFilter, isSuperAdmin]);
 
   const counts = useMemo(() => ({
-    total: visibleUsers.length, 
-    admins: visibleUsers.filter(u => u.role === "ADMIN" || u.role === "SUPER_ADMIN").length,
-    supervisors: visibleUsers.filter(u => u.role === "SUPERVISOR").length, 
-    agents: visibleUsers.filter(u => u.role === "AGENT").length,
+    total: visibleUsers.length, admins: visibleUsers.filter(u => u.role === "ADMIN" || u.role === "SUPER_ADMIN").length,
+    supervisors: visibleUsers.filter(u => u.role === "SUPERVISOR").length, agents: visibleUsers.filter(u => u.role === "AGENT").length,
   }), [visibleUsers]);
 
   return (
     <div className="relative min-h-screen text-slate-800 font-sans pb-24 selection:bg-indigo-500 selection:text-white">
       <div className="mesh-bg" />
 
-      {/* TOP HEADER */}
       <header className="glass-bar sticky top-0 z-40 px-6 py-4 font-sans">
         <div className="mx-auto flex max-w-7xl items-center justify-between">
           <div className="flex items-center gap-3">
@@ -101,14 +70,12 @@ export default function AdminConsole() {
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <h1 className="text-sm font-black uppercase text-slate-900">
-                  {isSuperAdmin ? "Global Headquarters" : "Project Admin Console"}
-                </h1>
-                <span className={`rounded-full border px-2.5 py-0.5 text-[10px] font-bold font-mono ${isSuperAdmin ? 'bg-rose-50/80 border-rose-200/80 text-rose-600' : 'bg-indigo-50/80 border-indigo-200 text-indigo-700'}`}>
-                  {isSuperAdmin ? "ROOT ACCESS" : `${myProject} TENANT`}
-                </span>
+                <h1 className="text-sm font-black uppercase text-slate-900">{isSuperAdmin ? "Global Headquarters" : "Project Admin Console"}</h1>
+                <span className={`rounded-full border px-2.5 py-0.5 text-[10px] font-bold font-mono ${isSuperAdmin ? 'bg-rose-50/80 border-rose-200/80 text-rose-600' : 'bg-indigo-50/80 border-indigo-200 text-indigo-700'}`}>{isSuperAdmin ? "ROOT ACCESS" : `${myProject} TENANT`}</span>
+                {/* ⚡ THE TOGGLE FOR ADMIN */}
+                <WorkModeToggle profile={profile} />
               </div>
-              <p className="text-xs text-slate-500 mt-0.5 font-sans">Operator: <strong className="text-slate-700">{profile?.name}</strong></p>
+              <p className="text-xs text-slate-500 mt-1 font-sans">Operator: <strong className="text-slate-700">{profile?.name}</strong></p>
             </div>
           </div>
           
@@ -123,41 +90,28 @@ export default function AdminConsole() {
             <button onClick={() => setShowProvision(true)} className="btn-glass flex items-center gap-2 rounded-xl px-4 py-2 text-xs font-black uppercase tracking-wider cursor-pointer font-sans">
               <UserPlus size={14} /> <span>Provision User</span>
             </button>
-            <button onClick={logout} className="btn-soft flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-bold text-rose-600 cursor-pointer font-sans">
+            <button onClick={handleSafeLogout} className="btn-soft flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-bold text-rose-600 cursor-pointer font-sans">
               <LogOut size={13} /> Logout
             </button>
           </div>
         </div>
       </header>
 
-      {/* ⚡ THE BRAND NEW CLEAN TAB NAVIGATION BAR */}
       <div className="glass-bar relative z-10 py-3 px-6 font-sans">
         <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3 text-xs font-mono font-bold">
           <div className="flex flex-wrap gap-2">
-            <button 
-              onClick={() => setActiveTab("DIRECTORY")} 
-              className={`px-4 py-2 rounded-xl cursor-pointer transition-all font-sans ${activeTab === "DIRECTORY" ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/25" : "btn-soft text-slate-500 hover:text-indigo-600"}`}
-            >
+            <button onClick={() => setActiveTab("DIRECTORY")} className={`px-4 py-2 rounded-xl cursor-pointer transition-all font-sans ${activeTab === "DIRECTORY" ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/25" : "btn-soft text-slate-500 hover:text-indigo-600"}`}>
               ⚡ Workforce Directory
             </button>
-            
             {isSuperAdmin && (
-              <button 
-                onClick={() => setActiveTab("TENANTS")} 
-                className={`px-4 py-2 rounded-xl cursor-pointer flex items-center gap-1.5 transition-all font-sans ${activeTab === "TENANTS" ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/25" : "btn-soft text-slate-500 hover:text-indigo-600"}`}
-              >
+              <button onClick={() => setActiveTab("TENANTS")} className={`px-4 py-2 rounded-xl cursor-pointer flex items-center gap-1.5 transition-all font-sans ${activeTab === "TENANTS" ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/25" : "btn-soft text-slate-500 hover:text-indigo-600"}`}>
                 <FolderPlus size={14} /> Manage Tenants
               </button>
             )}
-
-            <button 
-              onClick={() => setActiveTab("SETTINGS")} 
-              className={`px-4 py-2 rounded-xl cursor-pointer flex items-center gap-1.5 transition-all font-sans ${activeTab === "SETTINGS" ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/25" : "btn-soft text-slate-500 hover:text-indigo-600"}`}
-            >
+            <button onClick={() => setActiveTab("SETTINGS")} className={`px-4 py-2 rounded-xl cursor-pointer flex items-center gap-1.5 transition-all font-sans ${activeTab === "SETTINGS" ? "bg-indigo-600 text-white shadow-md shadow-indigo-500/25" : "btn-soft text-slate-500 hover:text-indigo-600"}`}>
               <SlidersHorizontal size={14} /> Floor Invariants
             </button>
           </div>
-          
           <span className="text-slate-400 font-sans">
             Scope Filter: <strong className="text-emerald-600 font-bold font-mono">{isSuperAdmin ? "GLOBAL (ALL DATA)" : `${myProject} STRICT`}</strong>
           </span>
@@ -165,27 +119,13 @@ export default function AdminConsole() {
       </div>
 
       <main className="relative z-10 mx-auto max-w-7xl px-6 mt-8 font-sans">
-        
-        {/* TAB 1: WORKFORCE DIRECTORY (Full Screen Width!) */}
         {activeTab === "DIRECTORY" && (
           <div className="space-y-8 animate-in fade-in zoom-in-95 duration-300">
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4 font-mono">
-              <div className="glass rounded-[28px] p-5">
-                <span className="text-[10px] text-slate-400 uppercase font-bold block mb-1 font-sans">{isSuperAdmin ? "Total Workforce" : "Project Workforce"}</span>
-                <div className="text-3xl font-black text-slate-900">{counts.total}</div>
-              </div>
-              <div className="glass rounded-[28px] p-5 text-rose-700">
-                <span className="text-[10px] text-slate-400 uppercase font-bold block mb-1 font-sans">Admins</span>
-                <div className="text-3xl font-black text-slate-900">{counts.admins}</div>
-              </div>
-              <div className="glass rounded-[28px] p-5 text-indigo-700">
-                <span className="text-[10px] text-slate-400 uppercase font-bold block mb-1 font-sans">Supervisors</span>
-                <div className="text-3xl font-black text-slate-900">{counts.supervisors}</div>
-              </div>
-              <div className="glass rounded-[28px] p-5 text-emerald-700">
-                <span className="text-[10px] text-slate-400 uppercase font-bold block mb-1 font-sans">Agents</span>
-                <div className="text-3xl font-black text-slate-900">{counts.agents}</div>
-              </div>
+              <div className="glass rounded-[28px] p-5"><span className="text-[10px] text-slate-400 uppercase font-bold block mb-1 font-sans">{isSuperAdmin ? "Total Workforce" : "Project Workforce"}</span><div className="text-3xl font-black text-slate-900">{counts.total}</div></div>
+              <div className="glass rounded-[28px] p-5 text-rose-700"><span className="text-[10px] text-slate-400 uppercase font-bold block mb-1 font-sans">Admins</span><div className="text-3xl font-black text-slate-900">{counts.admins}</div></div>
+              <div className="glass rounded-[28px] p-5 text-indigo-700"><span className="text-[10px] text-slate-400 uppercase font-bold block mb-1 font-sans">Supervisors</span><div className="text-3xl font-black text-slate-900">{counts.supervisors}</div></div>
+              <div className="glass rounded-[28px] p-5 text-emerald-700"><span className="text-[10px] text-slate-400 uppercase font-bold block mb-1 font-sans">Agents</span><div className="text-3xl font-black text-slate-900">{counts.agents}</div></div>
             </div>
 
             <div className="glass rounded-[32px] p-7 space-y-6 font-sans">
@@ -238,17 +178,15 @@ export default function AdminConsole() {
           </div>
         )}
 
-        {/* TAB 2: MANAGE TENANTS (Centered & Clean) */}
         {activeTab === "TENANTS" && isSuperAdmin && (
           <div className="max-w-2xl mx-auto animate-in fade-in zoom-in-95 duration-300 mt-12">
             <ProjectTenantsManagerCard projectsList={projectsList} profile={profile} />
           </div>
         )}
 
-        {/* TAB 3: FLOOR INVARIANTS (Centered & Clean) */}
         {activeTab === "SETTINGS" && (
           <div className="max-w-2xl mx-auto animate-in fade-in zoom-in-95 duration-300 mt-12">
-            <ConfigSettingsCard currentSettings={settings} isSuperAdmin={isSuperAdmin} myProject={myProject} />
+            <ConfigSettingsCard isSuperAdmin={isSuperAdmin} myProject={myProject} projectsList={projectsList} />
           </div>
         )}
 
@@ -319,17 +257,23 @@ function ProjectTenantsManagerCard({ projectsList, profile }) {
   );
 }
 
-function ConfigSettingsCard({ currentSettings, isSuperAdmin, myProject }) {
-  const [form, setForm] = useState(currentSettings); 
+function ConfigSettingsCard({ isSuperAdmin, myProject, projectsList }) {
+  const [targetTenant, setTargetTenant] = useState(isSuperAdmin ? (projectsList[0] || "GENERAL") : myProject);
+  const [form, setForm] = useState(DEFAULT_SETTINGS); 
   const [busy, setBusy] = useState(false); 
   const [saved, setSaved] = useState(false);
   
-  useEffect(() => { setForm(currentSettings); }, [currentSettings]);
+  useEffect(() => { 
+    const unsub = onSnapshot(doc(db, "project_settings", targetTenant), snap => { 
+      if (snap.exists()) setForm(snap.data()); else setForm(DEFAULT_SETTINGS);
+    }); 
+    return () => unsub(); 
+  }, [targetTenant]);
   
   const handleSaveConfig = async (e) => { 
     e.preventDefault(); setBusy(true); 
     try { 
-      await setDoc(doc(db, "break_settings", "config"), { ...form, updatedAt: serverTimestamp() }, { merge: true }); 
+      await setDoc(doc(db, "project_settings", targetTenant), { ...form, updatedAt: serverTimestamp() }, { merge: true }); 
       setSaved(true); setTimeout(() => setSaved(false), 2500); 
     } catch (err) { alert(err.message); } finally { setBusy(false); } 
   };
@@ -337,7 +281,16 @@ function ConfigSettingsCard({ currentSettings, isSuperAdmin, myProject }) {
   return (
     <div className="glass rounded-[32px] p-8 space-y-6 font-sans">
       <div className="flex justify-between items-center border-b border-slate-200/80 pb-4 font-mono font-bold text-xs text-indigo-600">
-        <span className="flex items-center gap-2"><SlidersHorizontal size={16} /> {isSuperAdmin ? "Global" : myProject} WFM Timings & Lockouts</span>
+        <div className="flex items-center gap-2">
+          <SlidersHorizontal size={16} /> 
+          {isSuperAdmin ? (
+            <select value={targetTenant} onChange={e => setTargetTenant(e.target.value)} className="bg-indigo-50 border border-indigo-200 px-2 py-1 rounded-lg text-indigo-700 outline-none cursor-pointer">
+              {projectsList.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          ) : (
+             <span>{myProject} WFM Timings</span>
+          )}
+        </div>
         {saved ? <span className="text-emerald-700 font-black bg-emerald-50 px-3 py-1 rounded-full border border-emerald-200 shadow-sm">✓ LEDGER SAVED</span> : <span className="text-[10px] text-slate-400 uppercase tracking-widest bg-slate-50 px-3 py-1 rounded-full border border-slate-200">Invariants</span>}
       </div>
       
@@ -392,9 +345,12 @@ function AdminUserRow({ user, livePresence, onEdit, isSuperAdmin }) {
   let projectedStatus = "OFFLINE"; 
   let effWorkMode = user.workMode || "WFO";
   
-  if (livePresence) {
-    projectedStatus = (livePresence.status === "OFFLINE" || !livePresence.status) 
-      ? (user.role === "AGENT" ? "AVAILABLE" : "ONLINE") : livePresence.status;
+  if (livePresence && livePresence.status === "ONLINE") {
+    if (user.role === "AGENT") projectedStatus = user.activeShiftId ? "AVAILABLE" : "PRE_SHIFT";
+    else projectedStatus = "ONLINE";
+    if (livePresence.workMode) effWorkMode = livePresence.workMode;
+  } else if (livePresence && livePresence.status !== "OFFLINE") {
+    projectedStatus = livePresence.status;
     if (livePresence.workMode) effWorkMode = livePresence.workMode;
   }
 
@@ -463,6 +419,7 @@ function UserStatusBadge({ status }) {
   const map = { 
     ONLINE: { text: "Online", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" }, 
     AVAILABLE: { text: "Available", cls: "bg-emerald-50 text-emerald-700 border-emerald-200 font-bold" }, 
+    PRE_SHIFT: { text: "Pre-Shift", cls: "bg-blue-50 text-blue-600 border-blue-200 font-bold" },
     IN_QUEUE: { text: "In Queue", cls: "bg-indigo-50 text-indigo-700 border-indigo-200" }, 
     ON_BREAK: { text: "On Break", cls: "bg-amber-50 text-amber-700 border-amber-200 font-bold animate-pulse" }, 
     BREAK_EXCEEDED: { text: "Over Limit", cls: "bg-rose-50 text-rose-700 border-rose-200 font-black animate-ping" }, 

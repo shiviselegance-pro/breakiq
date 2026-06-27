@@ -1,16 +1,17 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { httpsCallable } from "firebase/functions";
-import { functions } from "../firebase";
+import { auth, functions } from "../firebase";
 import { useAuth } from "../context/AuthContext";
 import { useFloorData } from "../hooks/useFloorData";
 import { useHeartbeat, useOnlineRoster } from "../hooks/usePresence";
 import { useBreakManagement } from "../hooks/useBreakManagement";
 import { toMillis, formatClock } from "../utils/timeHelpers";
 import { downloadMonthlyBreakReport } from "../utils/exportReport";
+import { WorkModeToggle } from "./AgentConsole"; 
 import { Activity, Users, AlertTriangle, LogOut, Download, Loader2, WifiOff, Search, Shield, UserPlus, Trash2 } from "lucide-react";
 
 export default function SupervisorTower() {
-  const { profile, logout } = useAuth();
+  const { profile } = useAuth();
   useHeartbeat(profile?.uid, profile?.name, profile?.role);
 
   const supervisorsOnline = useOnlineRoster("SUPERVISOR");
@@ -25,8 +26,6 @@ export default function SupervisorTower() {
   const [togglingOutage, setTogglingOutage] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("ALL");
-  
-  // ⚡ NUCLEAR FLUSH STATE
   const [flushing, setFlushing] = useState(false);
 
   const myProject = (profile?.project || "GENERAL").trim().toUpperCase();
@@ -35,6 +34,11 @@ export default function SupervisorTower() {
   const max = settings.maxConcurrentBreaks || 2;
   const onlineAgentIds = new Set(agentsOnline.map(a => a.id || a.uid));
   const isFloorFrozen = settings?.emergencyLockout;
+
+  const handleSafeLogout = async () => {
+    try { await auth.signOut(); } catch(e) {}
+    setTimeout(() => { window.location.replace("/"); }, 400);
+  };
 
   const handleToggleLockdown = async () => {
     const action = isFloorFrozen ? "Lift Outage Lockdown" : "Trigger Emergency Floor Pause";
@@ -57,7 +61,6 @@ export default function SupervisorTower() {
     catch (e) { alert(e.message); } finally { setRemoving(null); }
   };
 
-  // ⚡ INDIVIDUAL REJECT FUNCTION
   const handleRejectBreak = async (uid) => {
     if (!confirm("Reject this pending break request?")) return;
     setRevoking(uid);
@@ -65,7 +68,6 @@ export default function SupervisorTower() {
     catch (e) { alert(e.message); } finally { setRevoking(null); }
   };
 
-  // ⚡ FLUSH GHOST QUEUE
   const handleFlushQueue = async () => {
     if (!confirm(`NUCLEAR OPTION: Clear all ${pendingBreaks.length} pending/ghost breaks from the pipeline?`)) return;
     setFlushing(true);
@@ -98,8 +100,22 @@ export default function SupervisorTower() {
 
       <header className="glass-bar sticky top-0 z-40 px-6 py-4 font-sans">
         <div className="mx-auto flex max-w-7xl items-center justify-between">
-          <div className="flex items-center gap-3"><div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-600 to-violet-600 text-white font-black text-sm shadow-md font-mono">TL</div><div><div className="flex items-center gap-2"><h1 className="text-sm font-black uppercase text-slate-900">Supervisor Tower</h1><span className="rounded-full bg-indigo-50 border border-indigo-200 px-2 py-0.5 text-[10px] font-bold text-indigo-600 font-mono">{myProject}</span><span className="rounded-full bg-amber-50 border border-amber-200 px-2 py-0.5 text-[9px] font-mono font-bold text-amber-700">{profile?.workMode || "WFO"}</span></div><p className="text-xs text-slate-500 mt-0.5">Commander: <strong className="text-slate-700">{profile?.name}</strong> · Peer Leads Online: <strong className="text-indigo-600">{supervisorsOnline.length}</strong></p></div></div>
-          <div className="flex items-center gap-2.5 font-mono"><button onClick={handleToggleLockdown} disabled={togglingOutage} className={`flex items-center gap-2 rounded-xl px-4 py-2 text-xs font-bold uppercase cursor-pointer transition-all ${isFloorFrozen ? "bg-rose-600 text-white shadow-lg font-sans animate-pulse" : "btn-soft text-amber-700 font-sans"}`}>{togglingOutage ? <Loader2 size={14} className="animate-spin" /> : <AlertTriangle size={14} />} <span>{isFloorFrozen ? "🚨 Outage Active (Lift)" : "Pause Breaks (Outage)"}</span></button><button onClick={() => { setReportBusy(true); const d = new Date(); downloadMonthlyBreakReport(d.getFullYear(), d.getMonth() + 1).finally(() => setReportBusy(false)); }} disabled={reportBusy} className="btn-soft flex items-center gap-2 rounded-xl px-4 py-2 text-xs font-bold text-slate-700 cursor-pointer font-sans">{reportBusy ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />} <span>Export Reports</span></button><button onClick={logout} className="btn-soft flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-bold text-rose-600 cursor-pointer font-sans"><LogOut size={13} /> Logout</button></div>
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-600 to-violet-600 text-white font-black text-sm shadow-md font-mono">TL</div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h1 className="text-sm font-black uppercase text-slate-900">Supervisor Tower</h1>
+                <span className="rounded-full bg-indigo-50 border border-indigo-200 px-2 py-0.5 text-[10px] font-bold text-indigo-600 font-mono">{myProject}</span>
+                <WorkModeToggle profile={profile} />
+              </div>
+              <p className="text-xs text-slate-500 mt-1">Commander: <strong className="text-slate-700">{profile?.name}</strong> · Peer Leads Online: <strong className="text-indigo-600">{supervisorsOnline.length}</strong></p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2.5 font-mono">
+            <button onClick={handleToggleLockdown} disabled={togglingOutage} className={`flex items-center gap-2 rounded-xl px-4 py-2 text-xs font-bold uppercase cursor-pointer transition-all ${isFloorFrozen ? "bg-rose-600 text-white shadow-lg font-sans animate-pulse" : "btn-soft text-amber-700 font-sans"}`}>{togglingOutage ? <Loader2 size={14} className="animate-spin" /> : <AlertTriangle size={14} />} <span>{isFloorFrozen ? "🚨 Outage Active (Lift)" : "Pause Breaks (Outage)"}</span></button>
+            <button onClick={() => { setReportBusy(true); const d = new Date(); downloadMonthlyBreakReport(d.getFullYear(), d.getMonth() + 1).finally(() => setReportBusy(false)); }} disabled={reportBusy} className="btn-soft flex items-center gap-2 rounded-xl px-4 py-2 text-xs font-bold text-slate-700 cursor-pointer font-sans">{reportBusy ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />} <span>Export Reports</span></button>
+            <button onClick={handleSafeLogout} className="btn-soft flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-bold text-rose-600 cursor-pointer font-sans"><LogOut size={13} /> Logout</button>
+          </div>
         </div>
       </header>
 
@@ -117,8 +133,6 @@ export default function SupervisorTower() {
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4 font-mono">
           <div className="glass rounded-[28px] p-5 text-indigo-600"><span className="text-[10px] text-slate-400 uppercase font-bold block mb-1">Fenced Departures</span><div className="font-mono text-3xl font-black text-slate-900">{activeProjectBreaks.length}/{max}</div></div>
           <div className="glass rounded-[28px] p-5 text-slate-700"><span className="text-[10px] text-slate-400 uppercase font-bold block mb-1">Enrolled Staff</span><div className="font-mono text-3xl font-black text-slate-900">{myProjectAgents.length}</div></div>
-          
-          {/* ⚡ THE FLUSHABLE FIFO PIPELINE CARD */}
           <div className="glass rounded-[28px] p-5 text-slate-700 relative group transition-all">
             <span className="text-[10px] text-slate-400 uppercase font-bold block mb-1">FIFO Pipeline</span>
             <div className="font-mono text-3xl font-black text-slate-900">{pendingBreaks.length}</div>
@@ -128,7 +142,6 @@ export default function SupervisorTower() {
               </button>
             )}
           </div>
-          
           <div className="glass rounded-[28px] p-5 text-rose-700"><span className="text-[10px] text-slate-400 uppercase font-bold block mb-1">SLA Breaches</span><div className="font-mono text-3xl font-black text-slate-900">{exceededProjectBreaks.length}</div></div>
         </div>
 
@@ -184,10 +197,20 @@ function ProjectLightSpawningCard({ myProject }) {
 
 function SupervisoryLightRow({ agent, now, isRevoking, onForceEnd, onReject, isRemoving, onRemoveAccount }) {
   const bm = useBreakManagement(agent);
-  const isOnline = agent.isOnline; const isOnBreak = agent.status === "ON_BREAK"; const isBreached = agent.status === "BREAK_EXCEEDED"; const isInQueue = agent.status === "IN_QUEUE" || agent.status === "AWAITING_SLOT" || bm.activeBreak?.status === "APPROVED_SCHEDULED";
-  const sMs = toMillis(bm.shift?.shiftStart); const elMs = sMs ? Math.max(0, now - sMs) : 0;
-  const sHrs = String(Math.floor(elMs / 3600000)).padStart(2, "0"); const sMins = String(Math.floor((elMs % 3600000) / 60000)).padStart(2, "0"); const sSecs = String(Math.floor((elMs % 60000) / 1000)).padStart(2, "0");
-  const mTot = bm.budget?.mealTotal ?? 40; const sTot = bm.budget?.shortTotal ?? 20; const mLeft = bm.budget?.mealRemaining ?? mTot; const sLeft = bm.budget?.shortRemaining ?? sTot; const totUsed = mTot - mLeft + (sTot - sLeft);
+  const isOnline = agent.isOnline; 
+  const hasShift = !!agent.activeShiftId; // ⚡ THE FIX: Checks if agent has an active shift 
+  const isOnBreak = agent.status === "ON_BREAK"; 
+  const isBreached = agent.status === "BREAK_EXCEEDED"; 
+  const isInQueue = agent.status === "IN_QUEUE" || agent.status === "AWAITING_SLOT" || bm.activeBreak?.status === "APPROVED_SCHEDULED";
+  
+  const sMs = toMillis(bm.shift?.shiftStart); 
+  const elMs = sMs ? Math.max(0, now - sMs) : 0;
+  const sHrs = String(Math.floor(elMs / 3600000)).padStart(2, "0"); 
+  const sMins = String(Math.floor((elMs % 3600000) / 60000)).padStart(2, "0"); 
+  const sSecs = String(Math.floor((elMs % 60000) / 1000)).padStart(2, "0");
+  const mTot = bm.budget?.mealTotal ?? 40; const sTot = bm.budget?.shortTotal ?? 20; 
+  const mLeft = bm.budget?.mealRemaining ?? mTot; const sLeft = bm.budget?.shortRemaining ?? sTot; 
+  const totUsed = mTot - mLeft + (sTot - sLeft);
 
   let brkStr = "—";
   if (isOnBreak || isBreached) {
@@ -198,19 +221,40 @@ function SupervisoryLightRow({ agent, now, isRevoking, onForceEnd, onReject, isR
   const [disp, setDisp] = useState(false);
   const handleAssign = async () => { setDisp(true); try { await httpsCallable(functions, "requestBreakNow")({ category: "SHORT", minutesNow: Math.min(15, sLeft || 15), targetUid: agent.uid || agent.id }); } catch (e) { alert(e.message); } finally { setDisp(false); } };
 
+  // ⚡ SMART STATUS LOGIC
+  let displayStatus = "Offline";
+  let badgeColor = "bg-white/50 border-slate-200 text-slate-400"; 
+
+  if (isOnBreak) { displayStatus = "On Break"; badgeColor = "bg-amber-50/80 border-amber-200 text-amber-700 animate-pulse"; }
+  else if (isBreached) { displayStatus = "Over Limit"; badgeColor = "bg-rose-50/80 border-rose-200 text-rose-700 animate-ping"; }
+  else if (isInQueue) { displayStatus = "In Queue"; badgeColor = "bg-indigo-50/80 border-indigo-200 text-indigo-700"; }
+  else if (isOnline && hasShift) { displayStatus = "Available"; badgeColor = "bg-emerald-50/80 border-emerald-200 text-emerald-700"; }
+  else if (isOnline && !hasShift) { displayStatus = "Pre-Shift"; badgeColor = "bg-blue-50 border-blue-200 text-blue-600 font-bold"; } 
+
   return (
     <tr className={`hover:bg-indigo-50/30 font-sans transition-colors border-b border-slate-100 last:border-0 ${isBreached ? "bg-rose-50/60 font-sans" : ""}`}>
-      <td className="py-4 pl-5"><p className="font-bold text-slate-900 text-xs flex items-center gap-1.5"><span>{agent.name}</span> <span className="bg-purple-100 border border-purple-200 text-purple-800 font-mono font-bold text-[9px] px-1.5 py-0.5 rounded shadow-sm">{agent.workMode || "WFO"}</span></p><span className="font-mono text-[11px] text-slate-400 font-medium block mt-0.5">{agent.employeeId}</span></td>
-      <td className="py-4 px-3 font-mono"><span className="bg-white/60 border border-slate-200/70 px-2.5 py-1 rounded-md text-xs font-mono font-bold tabular-nums text-slate-800 tracking-tight inline-block">{sMs ? `${sHrs}:${sMins}:${sSecs}` : "OFFLINE"}</span></td>
+      <td className="py-4 pl-5">
+        <p className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
+          <span>{agent.name}</span> 
+          {/* ⚡ THE FIX: Hide WFH/WFO badge if NOT clocked in */}
+          {hasShift && <span className="bg-purple-100 border border-purple-200 text-purple-800 font-mono font-bold text-[9px] px-1.5 py-0.5 rounded shadow-sm">{agent.workMode || "WFO"}</span>}
+        </p>
+        <span className="font-mono text-[11px] text-slate-400 font-medium block mt-0.5">{agent.employeeId}</span>
+      </td>
+      
+      <td className="py-4 px-3 font-mono">
+        {/* ⚡ SHOW "Not Clocked In" if shift missing */}
+        <span className="bg-white/60 border border-slate-200/70 px-2.5 py-1 rounded-md text-xs font-mono font-bold tabular-nums text-slate-800 tracking-tight inline-block">
+          {hasShift && sMs ? `${sHrs}:${sMins}:${sSecs}` : "Not Clocked In"}
+        </span>
+      </td>
+      
       <td className="py-4 px-3 font-sans"><span className="text-slate-700 text-xs font-mono font-bold">{totUsed}m Used</span></td>
-      <td className="py-4 px-3 font-mono"><span className={`px-2 py-0.5 rounded-md border text-[10px] uppercase font-bold ${isOnBreak ? "bg-amber-50/80 border-amber-200 text-amber-700 animate-pulse" : isBreached ? "bg-rose-50/80 border-rose-200 text-rose-700 animate-ping" : isInQueue ? "bg-indigo-50/80 border-indigo-200 text-indigo-700" : isOnline ? "bg-emerald-50/80 border-emerald-200 text-emerald-700" : "bg-white/50 border-slate-200 text-slate-400"}`}>{isOnBreak ? "On Break" : isBreached ? "Over Limit" : isInQueue ? "In Queue" : isOnline ? "Available" : "Offline"}</span><p className="text-[10px] text-slate-400 mt-1 font-mono">{brkStr}</p></td>
+      <td className="py-4 px-3 font-mono"><span className={`px-2 py-0.5 rounded-md border text-[10px] uppercase font-bold ${badgeColor}`}>{displayStatus}</span><p className="text-[10px] text-slate-400 mt-1 font-mono">{brkStr}</p></td>
       <td className="py-4 text-right pr-5 font-sans">
         <div className="flex items-center justify-end gap-1.5">
-          {isOnline && agent.status === "AVAILABLE" && <button onClick={handleAssign} disabled={disp} className="btn-soft rounded-xl px-3 py-1.5 text-xs font-bold text-slate-700 cursor-pointer font-sans">{disp ? "..." : "Assign"}</button>}
-          
-          {/* ⚡ NEW: Reject Queued Break */}
+          {isOnline && hasShift && agent.status === "AVAILABLE" && <button onClick={handleAssign} disabled={disp} className="btn-soft rounded-xl px-3 py-1.5 text-xs font-bold text-slate-700 cursor-pointer font-sans">{disp ? "..." : "Assign"}</button>}
           {isInQueue && <button onClick={onReject} disabled={isRevoking} className="btn-soft px-3 py-1.5 text-xs font-bold text-rose-600 hover:bg-rose-50 cursor-pointer shadow-sm active:scale-95 transition-all font-sans">{isRevoking ? "..." : "Reject"}</button>}
-          
           {(isOnBreak || isBreached) && <button onClick={onForceEnd} disabled={isRevoking} className="btn-glass px-3 py-1.5 text-xs font-black cursor-pointer shadow-sm active:scale-95 transition-all font-sans">{isRevoking ? "..." : "Recall"}</button>}
           <button disabled={isRemoving} onClick={onRemoveAccount} className="text-slate-400 hover:text-rose-600 p-1.5 rounded-lg transition-colors cursor-pointer font-sans"><Trash2 size={13} /></button>
         </div>
