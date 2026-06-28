@@ -18,7 +18,7 @@ const FieldValue = admin.firestore.FieldValue;
 const Timestamp = admin.firestore.Timestamp;
 
 const ORG_DOMAIN = "breakapp.internal";
-const WHATSAPP_GATEWAY_URL = "https://wa-gateway-production-aaa5.up.railway.app/send-message"; 
+const WHATSAPP_GATEWAY_URL = "https://api.breakiq.in/send-message"; 
 const WHATSAPP_TOKEN = "ARES_SECRET_WA_KEY_2026";
 
 const DEFAULT_SETTINGS = {
